@@ -1,0 +1,26 @@
+<!DOCTYPE html>
+<!--
+  dsh-pet Android 渲染层入口页。
+  源项目：https://github.com/PC2005-cloud/dsh-pet （MIT License）
+  素材（动画/提示词/源视频）仅限开源使用，禁止商用。
+  说明：loadUrl https://appassets.androidplatform.net/assets/index.html（WebViewAssetLoader 映射）。
+  host.ts 的 realFetch('config.jsonc') / realFetch('webm/..') 走相对路径，最终由
+  /assets/ 与 /dsh-pet-7340/thumb/ 两个 PathHandler 落到 assets 目录。
+-->
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover, user-scalable=no" />
+  <title>dsh-pet</title>
+  <style>
+    html, body { margin: 0; padding: 0; width: 100%; height: 100%; background: transparent; overflow: hidden; }
+    /* WebView 透明：宠物外区域透出桌面 */
+    #dsh-pet-app { position: fixed; inset: 0; pointer-events: none; }
+  </style>
+  <!-- 字体预加载不做：bubble.ts 会注入 @font-face /dsh-pet-7340/font/上首软糖体.ttf -->
+</head>
+<body>
+  <div id="dsh-pet-app"></div>
+  <script src="/assets/dsh-pet.js"></script>
+</body>
+</html>

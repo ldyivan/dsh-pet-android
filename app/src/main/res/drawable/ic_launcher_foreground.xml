@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<vector xmlns:android="http://schemas.android.com/apk/res/android"
+    android:width="108dp" android:height="108dp"
+    android:viewportWidth="108" android:viewportHeight="108">
+    <!-- 简笔女仆头像是占位：圆脸 + 蓝发 + 白色发带 -->
+    <path android:fillColor="#FF4A6FA5" android:pathData="M54,26c-15,0 -25,11 -25,26v10h50v-10c0,-15 -10,-26 -25,-26z" />
+    <path android:fillColor="#FFF6E7D8" android:pathData="M54,40c-12,0 -19,9 -19,20c0,11 8,18 19,18s19,-7 19,-18c0,-11 -7,-20 -19,-20z" />
+    <path android:fillColor="#FFFFFFFF" android:pathData="M30,33h48v6h-48z" />
+    <path android:fillColor="#FF3A3A3A" android:pathData="M46,56m-3,0a3,3 0,1 1,6 0a3,3 0,1 1,-6 0" />
+    <path android:fillColor="#FF3A3A3A" android:pathData="M62,56m-3,0a3,3 0,1 1,6 0a3,3 0,1 1,-6 0" />
+</vector>

@@ -1,0 +1,28 @@
+# Gradle / Android 构建产物
+.gradle/
+build/
+app/build/
+local.properties
+captures/
+*.apk
+*.aab
+*.ap_
+*.dex
+
+# Kotlin
+.kotlin/
+
+# IDE
+.idea/
+*.iml
+.vscode/
+*.hprof
+
+# Node / 渲染层产物
+node_modules/
+renderer/dist/
+renderer/package-lock.json
+
+# 系统文件
+.DS_Store
+Thumbs.db

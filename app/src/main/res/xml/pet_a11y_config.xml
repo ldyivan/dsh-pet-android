@@ -1,0 +1,15 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  完全体模式用的无障碍服务配置。
+
+  刻意把能力压到最低：不读屏（canRetrieveWindowContent=false）、只要窗口状态事件、
+  不申请手势注入。它存在的唯一目的是给 TYPE_ACCESSIBILITY_OVERLAY 窗口提供一个
+  合法的 AccessibilityService Context，从而让渲染窗口成为系统「可信覆盖层」。
+-->
+<accessibility-service xmlns:android="http://schemas.android.com/apk/res/android"
+    android:accessibilityEventTypes="typeWindowStateChanged"
+    android:accessibilityFeedbackType="feedbackGeneric"
+    android:accessibilityFlags="flagDefault"
+    android:canRetrieveWindowContent="false"
+    android:description="@string/a11y_desc"
+    android:notificationTimeout="300" />

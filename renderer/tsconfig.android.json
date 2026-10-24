@@ -1,0 +1,21 @@
+{
+  "extends": "./tsconfig.json",
+  "compilerOptions": {
+    "noEmit": true,
+    "types": ["node"],
+    "skipLibCheck": true
+  },
+  "include": [
+    "android/entry.ts",
+    "android/host.ts",
+    "android/native.ts",
+    "android/petbridge.ts",
+    "src/client/pet.ts",
+    "src/client/bubble.ts",
+    "src/client/notify.ts",
+    "src/client/pose.ts",
+    "src/client/progress.ts",
+    "src/shared/**/*.ts"
+  ],
+  "exclude": ["src/**/*.test.ts", "src/app/**", "src/host/**", "src/standalone/**"]
+}

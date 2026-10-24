@@ -1,0 +1,25 @@
+{
+  "name": "dsh-pet-android-renderer",
+  "private": true,
+  "version": "1.0.9",
+  "description": "WebView 渲染层：把 android/entry.ts 打成单文件 bundle 供 Android 端加载",
+  "license": "MIT",
+  "type": "module",
+  "scripts": {
+    "build": "node build.mjs",
+    "watch": "node build.mjs --watch",
+    "dev": "node build.mjs --dev",
+    "sync": "node build.mjs && cp dist/dsh-pet.js ../app/src/main/assets/dsh-pet.js"
+  },
+  "dependencies": {
+    "esbuild": "^0.25.0",
+    "react": "^18.3.1",
+    "react-dom": "^18.3.1",
+    "typescript": "^5.6.3"
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.2",
+    "@types/react": "^18.3.12",
+    "@types/react-dom": "^18.3.1"
+  }
+}
