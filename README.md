@@ -133,7 +133,7 @@ Android 12 起，系统会读取 `Settings.Global.maximum_obscuring_opacity_for_
 设置页「关于与更新」卡片会请求本仓库的公开 Releases 接口：
 
 ```
-GET https://api.github.com/repos/PC2005-cloud/dsh-pet-android/releases/latest
+GET https://api.github.com/repos/ldyivan/dsh-pet-android/releases/latest
 ```
 
 - 不需要 token，只读公开信息；进入设置页 300ms 后会静默预查一次，失败只在卡片里写一行小字，不打扰
@@ -144,7 +144,7 @@ GET https://api.github.com/repos/PC2005-cloud/dsh-pet-android/releases/latest
 更新源常量在 `app/src/main/java/com/dsh/pet/UpdateChecker.kt` 顶部：
 
 ```kotlin
-private const val REPO_OWNER = "PC2005-cloud"
+private const val REPO_OWNER = "ldyivan"
 private const val REPO_NAME  = "dsh-pet-android"
 ```
 

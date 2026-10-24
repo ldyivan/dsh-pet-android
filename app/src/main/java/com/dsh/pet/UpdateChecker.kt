@@ -27,7 +27,7 @@ object UpdateChecker {
      *
      * fork 之后把这两行改成自己的账号/仓库名即可，别的地方都从这里取值。
      */
-    const val REPO_OWNER = "PC2005-cloud"
+    const val REPO_OWNER = "ldyivan"
     const val REPO_NAME = "dsh-pet-android"
 
     val repoUrl: String get() = "https://github.com/$REPO_OWNER/$REPO_NAME"

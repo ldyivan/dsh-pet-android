@@ -2,6 +2,11 @@
 
 本仓库是 **dsh-pet** 的 Android 原生移植工程，不是上游项目本身。
 
+| 项 | 内容 |
+|---|---|
+| 本仓库 | https://github.com/ldyivan/dsh-pet-android |
+| 应用名 / 包名 | 蓝色大肥鱼 / com.dsh.pet |
+
 ## 上游项目
 
 | 项 | 内容 |
