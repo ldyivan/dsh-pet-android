@@ -26,6 +26,7 @@ import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
+import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationManagerCompat
@@ -78,6 +79,13 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var modelEdit: EditText
     private lateinit var apiKeyEdit: EditText
     private lateinit var aiHint: TextView
+
+    // 关于与更新
+    private lateinit var updateBtn: Button
+    private lateinit var releaseBtn: Button
+    private lateinit var updateHint: TextView
+    /** 检查中：按钮置灰，避免连点把 GitHub 限额打满 */
+    private var checkingUpdate = false
 
     private val main = Handler(Looper.getMainLooper())
     private val REQ_NOTIFY = 1001
@@ -139,6 +147,8 @@ class SettingsActivity : AppCompatActivity() {
         loadAiSettings()
         loading = false
         refreshPermState()
+        // 进页面先静默查一次：用户不用点也知道有没有新版（失败只写小字，不弹窗）
+        main.postDelayed({ checkUpdate(true) }, 300L)
     }
 
     override fun onResume() {
@@ -355,10 +365,46 @@ class SettingsActivity : AppCompatActivity() {
             addView(aiHint)
         })
 
-        // ---------------- 关于 ----------------
+        // ---------------- 关于与更新 ----------------
         root.addView(card {
-            addView(sectionTitle(getString(R.string.settings_license)))
-            addView(desc(getString(R.string.settings_license_body)))
+            addView(sectionTitle("关于与更新"))
+            addView(
+                desc(
+                    "${getString(R.string.app_name)} " +
+                        "${UpdateChecker.currentVersion(this@SettingsActivity)} · " +
+                        "dsh-pet 的 Android 移植（MIT）",
+                ),
+            )
+
+            val btnRow = LinearLayout(this@SettingsActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, dp(6), 0, 0)
+            }
+            updateBtn = pill("检查更新", true) { checkUpdate(false) }
+            releaseBtn = pill("打开发布页", false) { openUrl(UpdateChecker.releasesUrl) }
+            btnRow.addView(updateBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            btnRow.addView(
+                releaseBtn,
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(8) },
+            )
+            addView(btnRow)
+
+            updateHint = TextView(this@SettingsActivity).apply {
+                text = "点「检查更新」查询 GitHub 上有没有新版本。"
+                textSize = 12.5f
+                setTextColor(0xFF7A839A.toInt())
+                setPadding(0, dp(8), 0, dp(4))
+            }
+            addView(updateHint)
+
+            // 开源引用：主次分明地列出「本应用直接基于的」与「第三方依赖」
+            val ossBtn = pill("开源许可与引用项目", false) { showOssDialog() }
+            addView(
+                ossBtn,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply { topMargin = dp(8) },
+            )
         })
 
         return ScrollView(this).apply {
@@ -884,5 +930,185 @@ class SettingsActivity : AppCompatActivity() {
             "已自动保存 · 桌宠已重读配置"
         }
         if (!silent) Toast.makeText(this, getString(R.string.settings_ai_saved), Toast.LENGTH_SHORT).show()
+    }
+
+    // ------------------------------------------------------------ 关于与更新
+
+    /**
+     * 查 GitHub Releases 有没有新版本。
+     *
+     * 逻辑全在 [UpdateChecker] 里，这里只负责三件事：防连点（GitHub 未认证限额
+     * 60 次/小时/IP）、把按钮置灰、把结果翻译成用户能看懂的一句话。
+     *
+     * @param silent true = 静默预查（只更新小字，不弹窗、不打断用户）
+     */
+    private fun checkUpdate(silent: Boolean) {
+        if (checkingUpdate) return
+        checkingUpdate = true
+        if (::updateBtn.isInitialized) {
+            updateBtn.isEnabled = false
+            updateBtn.text = "检查中…"
+        }
+        if (::updateHint.isInitialized) {
+            updateHint.setTextColor(0xFF7A839A.toInt())
+            updateHint.text = "正在查询 GitHub…"
+        }
+        UpdateChecker.check(this) { result, error ->
+            checkingUpdate = false
+            if (::updateBtn.isInitialized) {
+                updateBtn.isEnabled = true
+                updateBtn.text = "检查更新"
+            }
+            val current = UpdateChecker.currentVersion(this)
+            val r = result
+            if (!::updateHint.isInitialized) return@check
+            when {
+                error != null -> {
+                    updateHint.setTextColor(0xFFC0392B.toInt())
+                    updateHint.text = "检查失败：$error"
+                    if (!silent) Toast.makeText(this, "检查失败：$error", Toast.LENGTH_LONG).show()
+                }
+                r == null -> {
+                    updateHint.setTextColor(0xFFC0392B.toInt())
+                    updateHint.text = "检查失败：没有拿到有效返回"
+                }
+                r.newer -> {
+                    updateHint.setTextColor(0xFF3B6FD6.toInt())
+                    updateHint.text = "发现新版本 ${r.tag}（当前 $current）"
+                    showUpdateDialog(r, current)
+                }
+                else -> {
+                    updateHint.setTextColor(0xFF3B7A57.toInt())
+                    updateHint.text = "已是最新版本（$current）· 最新发布 ${r.tag}"
+                    if (!silent) Toast.makeText(this, "已是最新版本", Toast.LENGTH_SHORT).show()
+                }
+            }
+        }
+    }
+
+    /** 有新版本时的三条路：去发布页 / 直接下 APK / 稍后 */
+    private fun showUpdateDialog(r: UpdateChecker.Result, current: String) {
+        val notes = r.notes.trim()
+        val msg = StringBuilder("当前版本：$current\n最新版本：${r.tag}")
+        if (notes.isNotEmpty()) {
+            msg.append("\n\n").append(if (notes.length > 600) notes.take(600) + "…" else notes)
+        }
+        val builder = AlertDialog.Builder(this)
+            .setTitle("发现新版本 ${r.tag}")
+            .setMessage(msg.toString())
+            .setPositiveButton("打开发布页") { _, _ -> openUrl(r.pageUrl) }
+            .setNegativeButton("稍后", null)
+        val apk = r.apkUrl
+        if (apk != null) builder.setNeutralButton("下载 APK") { _, _ -> openUrl(apk) }
+        builder.show()
+    }
+
+    /** 用浏览器打开链接；设备上没有浏览器时只提示，不崩 */
+    private fun openUrl(url: String) {
+        if (url.isBlank()) {
+            Toast.makeText(this, "链接为空，打不开", Toast.LENGTH_SHORT).show()
+            return
+        }
+        try {
+            startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url)))
+        } catch (e: Exception) {
+            Log.w("dsh-pet", "打开链接失败：$url（${e.message}）")
+            Toast.makeText(this, "打不开链接：这台设备上没有可用的浏览器", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /**
+     * 开源许可与引用项目。
+     *
+     * 主次分两层，别混在一起：
+     *  - **一、直接基于**：上游项目，没有它就没有这个 App（渲染层 / 动画 / 素材）
+     *  - **二、第三方依赖**：通用库（AndroidX / OkHttp），只用公开 API，没改源码
+     * 每一项点一下直达对应仓库；本应用自身也以 MIT 开源，链接放最上面。
+     */
+    private fun showOssDialog() {
+        val body = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(6), dp(20), 0)
+        }
+
+        fun line(text: String, size: Float, color: Long, top: Int = 0): TextView =
+            TextView(this).apply {
+                this.text = text
+                textSize = size
+                setTextColor(color.toInt())
+                setPadding(0, dp(top), 0, 0)
+            }
+
+        fun heading(text: String, top: Int): TextView = line(text, 13f, 0xFF141A2B, top).apply {
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+        }
+
+        // 本应用自身
+        body.addView(line("本应用：dsh-pet-android", 14f, 0xFF141A2B, 0).apply {
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+        })
+        body.addView(line("MIT License · 点这里打开本仓库", 12.5f, 0xFF3B6FD6).apply {
+            setOnClickListener { openUrl(UpdateChecker.repoUrl) }
+        })
+
+        // 一、直接基于
+        body.addView(heading("一、直接基于（上游项目）", 14))
+        body.addView(line("界面渲染层、桌宠动画与素材都来自它，Android 侧只做平台桥接。", 12f, 0xFF7A839A, 2))
+        addOssItem(
+            body,
+            "dsh-pet · PC2005-cloud",
+            "MIT License · Web 渲染层 / 桌宠动画 / 素材",
+            "https://github.com/PC2005-cloud/dsh-pet",
+        )
+
+        // 二、第三方依赖
+        body.addView(heading("二、第三方依赖", 16))
+        body.addView(line("只调用公开 API，未修改其源码。", 12f, 0xFF7A839A, 2))
+        addOssItem(
+            body,
+            "AndroidX Core / AppCompat / Activity",
+            "Apache License 2.0 · 基础组件与兼容层",
+            "https://github.com/androidx/androidx",
+        )
+        addOssItem(
+            body,
+            "AndroidX WebKit",
+            "Apache License 2.0 · WebViewAssetLoader（assets 素材映射）",
+            "https://github.com/androidx/androidx",
+        )
+        addOssItem(
+            body,
+            "OkHttp 4.12",
+            "Apache License 2.0 · AI 对话与更新检查的 HTTP 客户端",
+            "https://github.com/square/okhttp",
+        )
+        addOssItem(
+            body,
+            "Kotlin / Android SDK",
+            "Apache License 2.0 · 语言与平台运行时",
+            "https://github.com/JetBrains/kotlin",
+        )
+
+        AlertDialog.Builder(this)
+            .setTitle("开源许可与引用项目")
+            .setView(ScrollView(this).apply { addView(body) })
+            .setPositiveButton("关闭", null)
+            .show()
+    }
+
+    /** 开源引用里的一项：标题（蓝色可点）+ 许可与用途小字 */
+    private fun addOssItem(parent: LinearLayout, title: String, desc: String, url: String) {
+        parent.addView(TextView(this).apply {
+            text = title
+            textSize = 13.5f
+            setTextColor(0xFF3B6FD6.toInt())
+            setPadding(0, dp(10), 0, 0)
+            setOnClickListener { openUrl(url) }
+        })
+        parent.addView(TextView(this).apply {
+            text = desc
+            textSize = 12f
+            setTextColor(0xFF7A839A.toInt())
+        })
     }
 }

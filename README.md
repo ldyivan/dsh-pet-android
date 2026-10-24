@@ -18,6 +18,8 @@
 - **外观可调**：显示大小（40%~90% 屏宽）、透明度（30%~100%）、宠物数量
 - **完全体模式**：透明度真到 100% 且不影响桌面点击（见下节）
 - **通知栏控制**：隐藏 / 显示 / 停止桌宠
+- **检查更新**：设置页「关于与更新」卡片可查询 GitHub Releases，有新版本时可直接打开发布页或下载 APK
+- **开源引用**：设置页列出本应用直接基于的上游项目与第三方依赖，每一项都可点击跳转到对应仓库
 
 ## 架构
 
@@ -125,6 +127,37 @@ Android 12 起，系统会读取 `Settings.Global.maximum_obscuring_opacity_for_
 | `VIBRATE` | 触觉反馈 |
 | 无障碍服务（可选） | 仅用于完全体模式，见上节 |
 
+## 检查更新
+
+设置页「关于与更新」卡片会请求本仓库的公开 Releases 接口：
+
+```
+GET https://api.github.com/repos/PC2005-cloud/dsh-pet-android/releases/latest
+```
+
+- 不需要 token，只读公开信息；进入设置页 300ms 后会静默预查一次，失败只在卡片里写一行小字，不打扰
+- 版本比较在 `UpdateChecker.isNewer()` 里按数字段切分（`1.0.10` 比 `1.0.9` 新），不用字符串比较
+- 有新版本时弹窗提供三个动作：打开发布页 / 直接下载第一个 `.apk` 资产 / 稍后
+- 404 会被明确解释为「仓库还没有发布 Release」，而不是网络错误
+
+更新源常量在 `app/src/main/java/com/dsh/pet/UpdateChecker.kt` 顶部：
+
+```kotlin
+private const val REPO_OWNER = "PC2005-cloud"
+private const val REPO_NAME  = "dsh-pet-android"
+```
+
+fork 之后改这两行即可，其余 URL 都由它们派生。**发布新版本时请把 Release 的 tag 与 `app/build.gradle.kts` 的 `versionName` 对齐（例如 `v1.1.0`），并把 APK 作为资产上传**，否则检查更新找不到可下载的包。
+
+## 开源引用
+
+设置页「开源许可与引用项目」按主次分两层陈列：
+
+1. **直接基于**：`PC2005-cloud/dsh-pet`（MIT）——渲染层逻辑、宠物动画与素材来自该上游项目，本工程新增的是 Android 平台层
+2. **第三方依赖**：AndroidX Core / AppCompat / Activity、AndroidX WebKit、OkHttp 4.12、Kotlin 标准库与 Android SDK（均为 Apache 2.0）
+
+完整来源与许可声明见 [NOTICE.md](NOTICE.md)。
+
 ## 已知限制
 
 - 无障碍覆盖层在部分定制 ROM 上会被拒绝，此时自动回退到普通悬浮窗（透明度上限约 78%）
@@ -134,7 +167,9 @@ Android 12 起，系统会读取 `Settings.Global.maximum_obscuring_opacity_for_
 
 ## 发布
 
-构建产物（APK / AAB）不进仓库，见 `.gitignore`。可直接安装的调试包请在 **Releases** 下载，或按上面的步骤自行构建。
+构建产物（APK / AAB）不进仓库，见 `.gitignore`。可直接安装的包请在 **Releases** 下载，或按上面的步骤自行构建。
+
+发布 Release 时：tag 用 `v` + `versionName`（如 `v1.1.0`），标题同 tag，正文写变更点，并把 APK 上传为资产——「检查更新」依赖 `releases/latest` 与其中的 `.apk` 资产。
 
 ```bash
 gradle :app:assembleDebug
