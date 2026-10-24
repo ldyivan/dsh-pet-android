@@ -64,6 +64,7 @@
 ├── build.gradle.kts
 ├── settings.gradle.kts
 ├── gradle.properties
+├── gradlew / gradlew.bat / gradle/wrapper/   Gradle 8.9 Wrapper
 ├── LICENSE                       MIT
 └── NOTICE.md                     来源与许可说明
 ```
@@ -74,7 +75,7 @@
 
 - JDK 17
 - Android SDK Platform 35 + Build-Tools 35.0.0
-- Gradle 8.9（AGP 8.5.2 要求 ≥ 8.7）
+- Gradle 8.9（AGP 8.5.2 要求 ≥ 8.7）；仓库自带 Gradle Wrapper，直接用 `./gradlew` 即可，无需本机装 Gradle
 
 ### 出 APK
 
@@ -84,8 +85,8 @@
 # 1. 指向本机 SDK
 echo "sdk.dir=/path/to/Android/sdk" > local.properties
 
-# 2. 编译
-gradle :app:assembleDebug
+# 2. 编译（首次会自动下载 Gradle 8.9）
+./gradlew :app:assembleDebug
 # 产物：app/build/outputs/apk/debug/app-debug.apk
 ```
 
@@ -98,7 +99,7 @@ cd renderer
 npm install                 # esbuild / react / react-dom / typescript
 node build.mjs              # 产出 dist/dsh-pet.js
 cp dist/dsh-pet.js ../app/src/main/assets/dsh-pet.js
-cd .. && gradle :app:assembleDebug
+cd .. && ./gradlew :app:assembleDebug
 ```
 
 `build.mjs` 里有一条关键的重定向：`src/client/pet.ts` 中 `import { petBridge } from './settings'` 会被指向 `android/petbridge.ts`。原因是上游 `settings.ts` 是 DSH 平台设置页组件，依赖平台 primitives，不能进 WebView bundle。
@@ -172,7 +173,7 @@ fork 之后改这两行即可，其余 URL 都由它们派生。**发布新版�
 发布 Release 时：tag 用 `v` + `versionName`（如 `v1.1.0`），标题同 tag，正文写变更点，并把 APK 上传为资产——「检查更新」依赖 `releases/latest` 与其中的 `.apk` 资产。
 
 ```bash
-gradle :app:assembleDebug
+./gradlew :app:assembleDebug
 # 输出：app/build/outputs/apk/debug/app-debug.apk（约 65MB，主要体积是 WebM 动画素材）
 ```
 
