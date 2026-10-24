@@ -13,6 +13,10 @@
     <uses-permission android:name="android.permission.VIBRATE" />
     <uses-permission android:name="android.permission.INTERNET" />
     <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <!-- 后台保活：请求加入电池优化白名单（否则息屏/划掉后台会被系统清理） -->
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+    <!-- 后台保活：开机后按上次的开关状态恢复桌宠 -->
+    <uses-permission android:name="android.permission.RECEIVE_BOOT_COMPLETED" />
 
     <application
         android:allowBackup="true"
@@ -34,14 +38,29 @@
         </activity>
 
         <!-- 悬浮窗承载服务：WebView 渲染层 + 透明触摸层 -->
+        <!-- stopWithTask=false：任务被划掉时不跟着停服务（默认值，这里写死意图，避免被误改） -->
         <service
             android:name=".PetService"
             android:exported="false"
+            android:stopWithTask="false"
             android:foregroundServiceType="specialUse">
             <property
                 android:name="android.app.PROPERTY_SPECIAL_USE_FGS_SUBTYPE"
                 android:value="桌面宠物悬浮窗常驻渲染" />
         </service>
+        <!-- 保活接收器：重启/看门狗闹钟、开机、覆盖安装后按用户意图恢复桌宠 -->
+        <receiver
+            android:name=".KeepAliveReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="android.intent.action.BOOT_COMPLETED" />
+                <action android:name="android.intent.action.QUICKBOOT_POWERON" />
+                <action android:name="android.intent.action.MY_PACKAGE_REPLACED" />
+                <action android:name="com.dsh.pet.action.KEEPALIVE_RESTART" />
+                <action android:name="com.dsh.pet.action.KEEPALIVE_WATCHDOG" />
+            </intent-filter>
+        </receiver>
+
         <!-- 完全体模式：无障碍覆盖层窗口（系统 trusted overlay，不受遮挡判定约束） -->
         <service
             android:name=".PetA11yService"

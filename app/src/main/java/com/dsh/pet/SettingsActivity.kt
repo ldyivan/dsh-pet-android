@@ -58,6 +58,10 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var hideBtn: Button
     private lateinit var overlayBtn: Button
     private lateinit var notifyBtn: Button
+    // 后台保活
+    private lateinit var batteryBtn: Button
+    private lateinit var autoStartBtn: Button
+    private lateinit var keepAliveHint: TextView
 
     private lateinit var sizeSeek: SeekBar
     private lateinit var sizeVal: TextView
@@ -252,6 +256,31 @@ class SettingsActivity : AppCompatActivity() {
                 LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(8) },
             )
             addView(row2)
+        })
+
+        // ---------------- 后台保活 ----------------
+        root.addView(card {
+            addView(sectionTitle("后台保活"))
+            addView(desc("从最近任务划掉本应用后，系统会把桌宠连进程一起清掉。下面两项是系统级的「允许」，开着才不会掉。"))
+
+            batteryBtn = pill("电池优化", false) { KeepAlive.requestIgnoreBattery(this@SettingsActivity) }
+            addView(
+                batteryBtn,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply { topMargin = dp(10) },
+            )
+
+            autoStartBtn = pill("自启动管理（部分机型）", false) { KeepAlive.openAutoStart(this@SettingsActivity) }
+            addView(
+                autoStartBtn,
+                LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                ).apply { topMargin = dp(8) },
+            )
+
+            keepAliveHint = desc("")
+            addView(keepAliveHint)
         })
 
         // ---------------- 外观 ----------------
@@ -585,6 +614,16 @@ class SettingsActivity : AppCompatActivity() {
         // 反过来用户只在系统里开了总开关、没给运行时权限时，旧逻辑又显示「未授权」——
         // 这就是「系统里通知明明开着，这里却显示未授权」的误报来源。
         paintPermBtn(notifyBtn, notificationsReady(), "通知")
+
+        // 后台保活：电池优化白名单是「能不能活过息屏/划掉后台」的关键开关，红绿一眼可见。
+        // 自启动是 ROM 私有开关，没有可查询的官方 API，所以只给入口、不判断状态。
+        val batteryOk = KeepAlive.isIgnoringBattery(this)
+        paintPermBtn(batteryBtn, batteryOk, "电池优化")
+        keepAliveHint.text = if (batteryOk) {
+            "已允许后台运行。若仍被清理，请在「自启动管理」里把本应用设为允许，并把最近任务卡片下拉锁定。"
+        } else {
+            "未允许后台运行：息屏或划掉后台后可能被系统清理。点上面「电池优化」允许即可。"
+        }
     }
 
     /**
@@ -728,6 +767,10 @@ class SettingsActivity : AppCompatActivity() {
             return
         }
         val i = Intent(this, PetService::class.java)
+        // 先落「用户希望桌宠运行」的意图并挂看门狗，再启服务：
+        // 顺序反过来的话，服务刚起来就被 ROM 秒杀时会出现「意图没写、闹钟没挂 → 再也回不来」。
+        KeepAlive.setWanted(this, true)
+        KeepAlive.scheduleWatchdog(this)
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) startForegroundService(i) else startService(i)
         PetService.isHidden = false
         Toast.makeText(this, "桌宠已启动", Toast.LENGTH_SHORT).show()
@@ -735,6 +778,11 @@ class SettingsActivity : AppCompatActivity() {
     }
 
     private fun stopPet() {
+        // 主动停止 = 撤销保活：先清意图（onDestroy 据此不再挂闹钟），再清闹钟，最后停服务。
+        // 顺序不能乱：先 stopService 的话 onDestroy 里 wanted 还是 true，会把闹钟留下来，
+        // 15 分钟后桌宠自己又回来了——那就是「关不掉」。
+        KeepAlive.setWanted(this, false)
+        KeepAlive.cancelAll(this)
         stopService(Intent(this, PetService::class.java))
         Toast.makeText(this, "桌宠已停止", Toast.LENGTH_SHORT).show()
         main.postDelayed({ refreshPermState() }, 300)

@@ -147,7 +147,30 @@ class PetService : Service() {
             ACTION_HIDE_PET -> setPetHidden(true)
             ACTION_SHOW_PET -> setPetHidden(false)
         }
+        // 走到这里说明本次启动是「用户希望桌宠运行」的（启动按钮 / 通知栏动作 / 保活拉起）：
+        // 落盘意图（进程被 ROM 杀掉后靠它决定该不该复活），并挂上 15 分钟看门狗。
+        // 用户主动停止时由 SettingsActivity.stopPet 清掉这两样，所以不会变成关不掉的进程。
+        KeepAlive.setWanted(this, true)
+        KeepAlive.scheduleWatchdog(this)
         return START_STICKY
+    }
+
+    /**
+     * 最近任务被划掉（用户从多任务里 swipe 掉本应用）。
+     *
+     * 这是「桌宠被关掉」的主因：很多 ROM 把划掉任务当成强杀信号，连前台服务一起干掉。
+     * START_STICKY 在这里没用——系统认为那是用户意图，不会主动重启。
+     * 所以这里主动补两枪：
+     *  1. 立刻再 startForegroundService 一次（此时进程往往还没被回收，能当场续命）；
+     *  2. 无条件挂一个 800ms 后的闹钟——进程真被杀了，靠这条广播把服务拉回来。
+     * 注意 onTaskRemoved 之后任务列表里已经没有本应用，服务会以「无任务」形态继续跑。
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        super.onTaskRemoved(rootIntent)
+        if (!KeepAlive.isWanted(this)) return
+        val ok = KeepAlive.startPet(this, "task-removed")
+        KeepAlive.scheduleRestart(this)
+        Log.i("dsh-pet", "任务被移除，自启${if (ok) "已请求" else "请求失败，已挂闹钟"}")
     }
 
     // ---------------------------------------------------------------- 窗口
@@ -895,6 +918,9 @@ class PetService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        // 只有「用户主动停止」才清保活闹钟（那时 wanted 已被置 false）；
+        // 被系统/ROM 回收时 wanted 仍为 true，闹钟必须留着，否则就再也回不来了。
+        if (!KeepAlive.isWanted(this)) KeepAlive.cancelAll(this)
         try {
             webView?.let { wm.removeView(it) }
             for (v in touchViews) {
