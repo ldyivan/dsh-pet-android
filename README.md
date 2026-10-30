@@ -1,4 +1,11 @@
+
+![Seedum](https://socialify.git.ci/LazyImmortal/Seedum/image?custom_description=dsh-pet-android&custom_language=Kotlin&description=1&font=Inter&language=1&name=1&owner=1&pattern=Plus&theme=Auto)
+
 # 蓝色大肥鱼 · dsh-pet-android
+
+![Android](https://img.shields.io/badge/Android-9+-3DDC84?logo=android&logoColor=white)
+[![Latest Release](https://img.shields.io/github/release/ldyivan/dsh-pet-android.svg)](../../releases)
+[![All Releases Download](https://img.shields.io/github/downloads/ldyivan/dsh-pet-android/total.svg)](../../releases)
 
 把 [dsh-pet](https://github.com/PC2005-cloud/dsh-pet)（DSH 平台的桌面宠物插件）移植成独立 Android 应用：桌面上飘着一只会动、会说话、能拖拽的宠物。
 
