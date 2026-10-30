@@ -1,5 +1,5 @@
 
-![Seedum](https://socialify.git.ci/LazyImmortal/Seedum/image?custom_description=dsh-pet-android&custom_language=Kotlin&description=1&font=Inter&language=1&name=1&owner=1&pattern=Plus&theme=Auto)
+![dsh-pet-android](https://socialify.git.ci/ldyivan/dsh-pet-android/image?custom_description=dsh-pet-android&custom_language=Kotlin&description=1&font=Inter&language=1&name=1&owner=1&pattern=Plus&theme=Auto)
 
 # 蓝色大肥鱼 · dsh-pet-android
 
