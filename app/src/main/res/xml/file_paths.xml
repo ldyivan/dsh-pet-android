@@ -1,0 +1,11 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  仅供「App 内下载安装」用：把下载到 filesDir/updates/ 的 APK 通过 FileProvider
+  暴露成 content:// URI，再走 ACTION_VIEW 交给系统安装器。
+  只暴露 updates 子目录，不给整个 filesDir，缩小暴露面。
+-->
+<paths>
+    <files-path
+        name="updates"
+        path="updates/" />
+</paths>

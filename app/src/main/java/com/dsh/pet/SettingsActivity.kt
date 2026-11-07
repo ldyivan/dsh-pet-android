@@ -31,11 +31,17 @@ import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
 import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
+import androidx.core.view.isVisible
 import org.json.JSONArray
 import org.json.JSONObject
+import android.app.Dialog
 import android.content.ClipData
 import android.content.ClipboardManager
 import android.content.Context
+import android.graphics.Typeface
+import android.graphics.drawable.ColorDrawable
+import android.view.Window
+import android.widget.ProgressBar
 import java.io.File
 
 /**
@@ -1163,21 +1169,248 @@ class SettingsActivity : AppCompatActivity() {
         }
     }
 
-    /** 有新版本时的三条路：去发布页 / 直接下 APK / 稍后 */
+    /**
+     * 有新版本时：自定义美化卡片（版本胶囊 + 更新日志 + 双通道更新方式 + 下载进度）。
+     *
+     * 两条「更新方式」并列，语义分清：
+     *  · **App 内下载安装**（主推荐）：走 [UpdateInstaller] 下到私有目录再交系统安装器，
+     *    全程留在应用内，带百分比进度条；
+     *  · **浏览器打开**：走 [openUrl] 跳到 Release 页 / APK 直链，由浏览器下载，适合
+     *    想手动挑文件、或设备没装成「允许未知来源」的场景。
+     * 卡片用透明 Dialog 宿主 + 白卡（与崩溃日志弹窗同一套风格），宽 88% 屏。
+     */
     private fun showUpdateDialog(r: UpdateChecker.Result, current: String) {
         val notes = r.notes.trim()
-        val msg = StringBuilder("当前版本：$current\n最新版本：${r.tag}")
-        if (notes.isNotEmpty()) {
-            msg.append("\n\n").append(if (notes.length > 600) notes.take(600) + "…" else notes)
-        }
-        val builder = AlertDialog.Builder(this)
-            .setTitle("发现新版本 ${r.tag}")
-            .setMessage(msg.toString())
-            .setPositiveButton("打开发布页") { _, _ -> openUrl(r.pageUrl) }
-            .setNegativeButton("稍后", null)
         val apk = r.apkUrl
-        if (apk != null) builder.setNeutralButton("下载 APK") { _, _ -> openUrl(apk) }
-        builder.show()
+
+        // ---- 卡片根：白底圆角 ----
+        val card = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(22), dp(20), dp(22), dp(20))
+            background = roundRect(0xFFFFFFFF.toInt(), 22, 0)
+        }
+
+        // NEW 标签 + 标题
+        val iconBlock = TextView(this).apply {
+            text = "NEW"
+            textSize = 13f
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(Color.WHITE)
+            gravity = Gravity.CENTER
+            background = roundRect(0xFF3B6FD6.toInt(), 9, 0)
+            setPadding(dp(9), dp(4), dp(9), dp(4))
+        }
+        val titleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        titleRow.addView(iconBlock, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply { rightMargin = dp(10) })
+        titleRow.addView(TextView(this).apply {
+            text = "发现新版本"
+            textSize = 18f
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(0xFF141A2B.toInt())
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        card.addView(titleRow)
+
+        // 版本对比：当前 → 最新
+        val verRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(12), 0, 0)
+        }
+        verRow.addView(versionPill(current, 0xFFB9C0D0.toInt(), 0xFFEDF1F9.toInt()),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        verRow.addView(TextView(this).apply {
+            text = "→"
+            textSize = 16f
+            setTextColor(0xFF3B6FD6.toInt())
+            setTypeface(typeface, Typeface.BOLD)
+            setPadding(dp(10), 0, dp(10), 0)
+        })
+        verRow.addView(versionPill(r.tag, 0xFF3B6FD6.toInt(), 0xFFE3ECFF.toInt()),
+            LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        card.addView(verRow)
+
+        // 更新日志（可滚动）
+        if (notes.isNotEmpty()) {
+            card.addView(TextView(this).apply {
+                text = "更新日志"
+                textSize = 12f
+                setTypeface(typeface, Typeface.BOLD)
+                setTextColor(0xFF5B6B8C.toInt())
+                setPadding(0, dp(16), 0, dp(4))
+            })
+            val logScroll = ScrollView(this).apply {
+                isVerticalScrollBarEnabled = true
+                setBackgroundColor(0xFFF7F9FD.toInt())
+                setPadding(dp(12), dp(8), dp(12), dp(8))
+                background = roundRect(0xFFF7F9FD.toInt(), 12, 0xFFE8ECF4.toInt())
+                layoutParams = LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, dp(140),
+                )
+            }
+            logScroll.addView(TextView(this).apply {
+                text = if (notes.length > 500) notes.take(500) + "…" else notes
+                textSize = 13f
+                setTextColor(0xFF3A4258.toInt())
+                setLineSpacing(0f, 1.3f)
+            })
+            card.addView(logScroll)
+        }
+
+        // 更新方式
+        card.addView(TextView(this).apply {
+            text = "选择更新方式"
+            textSize = 12f
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(0xFF5B6B8C.toInt())
+            setPadding(0, dp(16), 0, dp(8))
+        })
+
+        // 通道 1：App 内下载安装（主推荐）
+        var downloadStarted = false
+        val inAppBtn = updateModeCard("App 内下载安装", "推荐 · 留在应用内，下载后引导安装", true)
+        inAppBtn.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+        )
+        card.addView(inAppBtn)
+
+        val progress = ProgressBar(this, null, 0, android.R.attr.progressBarStyleHorizontal).apply {
+            max = 100
+            isVisible = false
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(6),
+            ).apply { topMargin = dp(10) }
+        }
+        card.addView(progress)
+        val progressLabel = TextView(this).apply {
+            textSize = 12f
+            setTextColor(0xFF3B6FD6.toInt())
+            isVisible = false
+            setPadding(0, dp(4), 0, 0)
+            gravity = Gravity.CENTER
+        }
+        card.addView(progressLabel)
+
+        // 通道 2：浏览器打开（次级）
+        val browserBtn = updateModeCard("浏览器打开发布页", "在浏览器里下载 APK 或查看完整版本", false)
+        browserBtn.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = dp(10) }
+        card.addView(browserBtn)
+
+        // 稍后
+        var dlgRef: Dialog? = null
+        val laterBtn = pill("稍后", false) { }
+        laterBtn.layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = dp(10) }
+        card.addView(laterBtn)
+
+        // 透明 Dialog 宿主（先建好，稍后按钮用它 dismiss）
+        val dlg = Dialog(this).apply {
+            requestWindowFeature(Window.FEATURE_NO_TITLE)
+            setContentView(card)
+            window?.apply {
+                setDimAmount(0.5f)
+                setBackgroundDrawable(ColorDrawable(0x00000000))
+                setLayout((resources.displayMetrics.widthPixels * 0.88).toInt(),
+                    ViewGroup.LayoutParams.WRAP_CONTENT)
+            }
+        }
+        dlgRef = dlg
+        laterBtn.setOnClickListener { dlgRef?.dismiss() }
+
+        inAppBtn.setOnClickListener {
+            if (downloadStarted) return@setOnClickListener
+            if (apk == null) {
+                Toast.makeText(this, "该版本没有可直下的 APK，已改打开发布页", Toast.LENGTH_LONG).show()
+                openUrl(r.pageUrl)
+                return@setOnClickListener
+            }
+            downloadStarted = true
+            inAppBtn.isEnabled = false
+            inAppBtn.alpha = 0.55f
+            progress.isVisible = true
+            progressLabel.isVisible = true
+            progressLabel.text = "正在下载… 0%"
+            UpdateInstaller.downloadAndInstall(
+                this, apk,
+                { percent, finished ->
+                    progress.progress = percent
+                    progressLabel.text =
+                        if (finished) "下载完成，正在打开安装器…" else "正在下载… $percent%"
+                },
+                { file ->
+                    if (file == null) {
+                        downloadStarted = false
+                        inAppBtn.isEnabled = true
+                        inAppBtn.alpha = 1f
+                        progress.isVisible = false
+                        progressLabel.isVisible = true
+                        progressLabel.setTextColor(0xFFC0392B.toInt())
+                        progressLabel.text = "下载失败，请改用「浏览器打开发布页」"
+                    } else {
+                        progressLabel.isVisible = true
+                        progressLabel.setTextColor(0xFF3B7A57.toInt())
+                        progressLabel.text = "已下载，按系统提示安装即可"
+                    }
+                }
+            )
+        }
+        browserBtn.setOnClickListener { openUrl(r.pageUrl) }
+
+        dlg.show()
+    }
+
+    /** 版本胶囊：浅底描边 + 加粗，[oldColor] 当前版本、强调色最新版 */
+    private fun versionPill(label: String, textColor: Int, bgColor: Int) = TextView(this).apply {
+        text = label
+        textSize = 14f
+        setTypeface(typeface, Typeface.BOLD)
+        setTextColor(textColor)
+        background = roundRect(bgColor, 99, 0)
+        setPadding(dp(14), dp(5), dp(14), dp(5))
+    }
+
+    /** 「更新方式」卡片按钮：标题 + 副标题 + 右侧箭头，主/次两档配色 */
+    private fun updateModeCard(title: String, sub: String, primary: Boolean = true): View {
+        val container = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = roundRect(
+                if (primary) 0xFF3B6FD6.toInt() else 0xFFEDF1F9.toInt(),
+                14,
+                if (primary) 0 else 0xFFDCE2EF.toInt(),
+            )
+            setPadding(dp(14), dp(12), dp(14), dp(12))
+        }
+        val textCol = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            layoutParams = LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        }
+        textCol.addView(TextView(this).apply {
+            text = title
+            textSize = 14.5f
+            setTypeface(typeface, Typeface.BOLD)
+            setTextColor(if (primary) Color.WHITE else 0xFF2A3244.toInt())
+        })
+        textCol.addView(TextView(this).apply {
+            text = sub
+            textSize = 11.5f
+            setTextColor(if (primary) 0xCcFFFFFF.toInt() else 0xFF7A839A.toInt())
+        })
+        container.addView(textCol)
+        val chevron = TextView(this).apply {
+            text = "›"
+            textSize = 24f
+            setTextColor(if (primary) Color.WHITE else 0xFF3B6FD6.toInt())
+        }
+        container.addView(chevron)
+        return container
     }
 
     /** 用浏览器打开链接；设备上没有浏览器时只提示，不崩 */
