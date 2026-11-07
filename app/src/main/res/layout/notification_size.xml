@@ -1,0 +1,204 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  dsh-pet 常驻通知自定义展开视图（大小调节滑块进度条）。
+  布局：标题 / 状态文本 / 「大小：」+ 滑块进度条(SeekBar) + 当前百分比。
+  系统限制：RemoteViews 无法监听 SeekBar 拖动事件，故用 11 个透明点击热区叠在
+  SeekBar 上方，点击任意段直接设值；视觉上就是连贯的滑块进度条。
+  注意：通知 RemoteViews inflate 的 Context 无完整主题，不能用 ?android:attr/ 主题属性
+  （会 InflateException 闪退），全部用硬编码颜色值（通知面板深色，用白色系）。
+-->
+<LinearLayout xmlns:android="http://schemas.android.com/apk/res/android"
+    android:layout_width="match_parent"
+    android:layout_height="wrap_content"
+    android:padding="8dp"
+    android:orientation="vertical">
+
+    <TextView
+        android:id="@+id/nt_title"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:textSize="16sp"
+        android:textStyle="bold"
+        android:textColor="#FFFFFFFF" />
+
+    <TextView
+        android:id="@+id/nt_text"
+        android:layout_width="wrap_content"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="2dp"
+        android:textSize="13sp"
+        android:textColor="#CCFFFFFF" />
+
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="6dp"
+        android:orientation="horizontal"
+        android:gravity="center_vertical">
+
+        <TextView
+            android:id="@+id/nt_size_label"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="大小："
+            android:textSize="13sp"
+            android:textColor="#FFFFFFFF" />
+
+        <!-- 直线进度条 + 11 个透明点击热区：RemoteViews 无法监听拖动，热区点哪段设哪档 -->
+        <FrameLayout
+            android:layout_width="0dp"
+            android:layout_height="48dp"
+            android:layout_weight="1"
+            android:layout_marginStart="4dp"
+            android:layout_marginEnd="4dp">
+
+            <!-- 水平进度条：必须显式 Horizontal style，否则默认渲染成圆形看不见 -->
+            <ProgressBar
+                android:id="@+id/nt_seekbar"
+                style="@android:style/Widget.ProgressBar.Horizontal"
+                android:layout_width="match_parent"
+                android:layout_height="10dp"
+                android:layout_gravity="center_vertical"
+                android:max="10"
+                android:progress="2"
+                android:progressDrawable="@drawable/progress_horizontal"
+                android:contentDescription="桌宠大小调节" />
+
+            <!-- 11 个透明点击热区（视觉不可见，只负责点击设值；无背景避免主题属性崩溃） -->
+            <LinearLayout
+                android:layout_width="match_parent"
+                android:layout_height="48dp"
+                android:orientation="horizontal">
+
+                <ImageView
+                    android:id="@+id/nt_seg_1"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1" />
+
+                <ImageView
+                    android:id="@+id/nt_seg_2"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1" />
+
+                <ImageView
+                    android:id="@+id/nt_seg_3"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1" />
+
+                <ImageView
+                    android:id="@+id/nt_seg_4"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1" />
+
+                <ImageView
+                    android:id="@+id/nt_seg_5"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1" />
+
+                <ImageView
+                    android:id="@+id/nt_seg_6"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1" />
+
+                <ImageView
+                    android:id="@+id/nt_seg_7"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1" />
+
+                <ImageView
+                    android:id="@+id/nt_seg_8"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1" />
+
+                <ImageView
+                    android:id="@+id/nt_seg_9"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1" />
+
+                <ImageView
+                    android:id="@+id/nt_seg_10"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1" />
+
+                <ImageView
+                    android:id="@+id/nt_seg_11"
+                    android:layout_width="0dp"
+                    android:layout_height="match_parent"
+                    android:layout_weight="1" />
+
+            </LinearLayout>
+
+        </FrameLayout>
+
+        <TextView
+            android:id="@+id/nt_size_value"
+            android:layout_width="wrap_content"
+            android:layout_height="wrap_content"
+            android:text="50%"
+            android:textSize="13sp"
+            android:textColor="#FFFFFFFF"
+            android:textStyle="bold" />
+
+    </LinearLayout>
+
+    <!-- 展开态按钮行：与收起态 action 一致，保证展开后仍可操作（RemoteViews 仅标准控件） -->
+    <LinearLayout
+        android:layout_width="match_parent"
+        android:layout_height="wrap_content"
+        android:layout_marginTop="4dp"
+        android:orientation="horizontal">
+
+        <TextView
+            android:id="@+id/nt_btn_toggle"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:paddingTop="6dp"
+            android:paddingBottom="6dp"
+            android:gravity="center"
+            android:text="暂时隐藏"
+            android:textSize="12sp"
+            android:textColor="#FFFFFFFF"
+            android:background="@drawable/nt_btn_bg" />
+
+        <TextView
+            android:id="@+id/nt_btn_home"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="6dp"
+            android:paddingTop="6dp"
+            android:paddingBottom="6dp"
+            android:gravity="center"
+            android:text="归位"
+            android:textSize="12sp"
+            android:textColor="#FFFFFFFF"
+            android:background="@drawable/nt_btn_bg" />
+
+        <TextView
+            android:id="@+id/nt_btn_settings"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="6dp"
+            android:paddingTop="6dp"
+            android:paddingBottom="6dp"
+            android:gravity="center"
+            android:text="设置"
+            android:textSize="12sp"
+            android:textColor="#FFFFFFFF"
+            android:background="@drawable/nt_btn_bg" />
+
+    </LinearLayout>
+
+</LinearLayout>

@@ -2027,6 +2027,26 @@ export function makePetUI(rt: {
       setAnim(name);
     };
 
+    // ---- 归位（回到初始位置）：右键菜单「回到初始位置」与通知栏「归位」按钮共用同一逻辑。
+    // 停漫游/移动/抛掷，清掉拖拽/漫游留下的会话位置，回配置角落。
+    const goHome = () => {
+      stopThrow();
+      stopMove();
+      setCustomPos(null);
+    };
+    // 注册到 petBridge.homeCallbacks：通知栏「归位」经 host.ts 的 window.__dshPetHome 遍历调用。
+    // 每次渲染都重新注册（闭包里的 stopThrow/stopMove 是当轮函数），用数组去重避免重复注册。
+    useEffect(() => {
+      if (!petBridge.homeCallbacks.includes(goHome)) {
+        petBridge.homeCallbacks.push(goHome);
+      }
+      return () => {
+        const i = petBridge.homeCallbacks.indexOf(goHome);
+        if (i >= 0) petBridge.homeCallbacks.splice(i, 1);
+      };
+      // goHome 引用 stopThrow/stopMove 等当轮闭包，刻意不进依赖（与既有 ref 同步写法一致）
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+    }, []);
     // ---- 右键菜单（统一自绘组件：树 + 渲染 + 样式与桌面共用 src/shared/menu.ts） ----
     // 注意：菜单是独立浮层，只在宠物命中区拦截右键（preventDefault + stopPropagation），
     // 绝不进入/改动 DSH 页面自己的菜单。浏览器端工具项 = 查看余额 / 碎碎念 / 对话 / 回到初始位置
@@ -2146,9 +2166,7 @@ export function makePetUI(rt: {
       }
       if (leaf.action === 'home') {
         // 回到初始位置：停漫游/移动/抛掷，清掉拖拽/漫游留下的会话位置，回配置角落
-        stopThrow();
-        stopMove();
-        setCustomPos(null);
+        goHome();
         return;
       }
       if (!leaf.anim) return;

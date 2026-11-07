@@ -407,9 +407,46 @@ export function mountContextMenu(opts: {
     }
   });
 
+  /** 把已展开的子面板链逐级收起（最深一级优先），返回是否还有任何可见面板 */
+  const collapseDeepest = (): boolean => {
+    if (openChild.size === 0) return false;
+    // 从 openChild 第一条链根出发沿链走到最深一级（根面板可能没有子面板，不能只从 rootPanel 走）
+    let start: HTMLElement | null = null;
+    for (const [parent] of openChild) {
+      start = parent;
+      break;
+    }
+    if (start === null) return false;
+    let deepest: HTMLElement | null = start;
+    let cur: HTMLElement | null = start;
+    while (cur !== null) {
+      deepest = cur;
+      cur = openChild.get(cur) ?? null;
+    }
+    if (deepest === null) return false;
+    // 收起最深面板，并从父面板的 openChild 里摘掉（链上其它层级保持原样）
+    const parent = findParentOf(deepest);
+    if (parent !== null) openChild.delete(parent);
+    deepest.style.display = 'none';
+    return true;
+  };
+  /** 沿 openChild 链反向找某个面板的父面板（无父 = 根面板或其兄弟） */
+  const findParentOf = (target: HTMLElement): HTMLElement | null => {
+    for (const [parent, child] of openChild) {
+      if (child === target) return parent;
+    }
+    return null;
+  };
+
   const onDocPointerDown = (e: MouseEvent): void => {
     if (closed) return;
     if (root.contains(e.target as Node)) return;
+    // 需求：点击菜单外要一级一级返回——若还有展开的子面板，先收起最深一级、保留父面板；
+    // 全部收起（只剩根面板）后才关闭整棵菜单。
+    if (openChild.size > 0) {
+      collapseDeepest();
+      return;
+    }
     close();
   };
   const onDocKeyDown = (e: KeyboardEvent): void => {

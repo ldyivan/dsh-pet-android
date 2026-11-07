@@ -13,6 +13,7 @@
  * 原则沿用原项目：**能力缺失就显式失败**，绝不伪造余额或假装模型调用成功。
  */
 import { native } from './native';
+import { petBridge } from './petbridge';
 import { readPose } from '../src/client/pose';
 
 type Leaf = { counter: number; data: unknown };
@@ -1023,6 +1024,10 @@ declare global {
     __dshReloadConfig?: () => void;
     /** 点击台词（原生侧点击回执里调） */
     __dshSaying?: (petId: string) => void;
+    /** 通知栏「归位」：遍历调用所有已注册的归位回调（每只 PetCard 一份）。 */
+    __dshPetHome?: () => void;
+    /** 通知栏「大小」：按 delta 增减 sizeRatio（0.40~0.90）并落盘 + 触发渲染层重拉。 */
+    __dshPetSize?: (delta: number) => void;
   }
 }
 window.__dshReloadConfig = (): void => {
@@ -1032,3 +1037,33 @@ window.__dshReloadConfig = (): void => {
 };
 /** 点击台词：从台词库里随机弹一句（原生侧在点击回执里调） */
 window.__dshSaying = (petId: string): void => sayRandom(petId === '' ? 'main' : petId);
+/** 归位：遍历所有已注册的 PetCard 归位回调（与右键菜单「回到初始位置」同一逻辑）。 */
+window.__dshPetHome = (): void => {
+  for (const cb of petBridge.homeCallbacks) {
+    try {
+      cb();
+    } catch (e) {
+      console.warn('[dsh-pet] 归位回调异常：' + (e instanceof Error ? e.message : String(e)));
+    }
+  }
+};
+/** 大小调节：delta 为归一化比例增量（如 +0.05 / -0.05），结果夹取到 0.40~0.90 后落盘并刷新渲染层。 */
+window.__dshPetSize = (delta: number): void => {
+  const ui = uiSettings();
+  const next = Math.min(PET_RATIO_MAX, Math.max(PET_RATIO_MIN, Math.round((ui.sizeRatio + (Number.isFinite(delta) ? delta : 0)) * 1000) / 1000));
+  if (next === ui.sizeRatio) return;
+  let raw: Record<string, unknown> = {};
+  try {
+    raw = JSON.parse(native.readUiSettings() || '{}') as Record<string, unknown>;
+  } catch {
+    raw = {};
+  }
+  raw.sizeRatio = next;
+  const ok = native.writeUiSettings(JSON.stringify(raw));
+  if (!ok) {
+    console.warn('[dsh-pet] 大小调节落盘失败');
+    return;
+  }
+  // 触发渲染层重拉配置（与设置页保存后 reloadConfig 同路）
+  writeSection('config', {});
+};

@@ -30,10 +30,14 @@ export const petBridge: {
   template: Pet | undefined;
   /** 宠物被真正点击（非拖拽）时回调：Android 侧用来播点击音效 + 弹一句随机台词（其余平台不注册）。 */
   clickFeedback?: (petId: string) => void;
+  /** 归位回调表：每只 PetCard 挂载时把自己的「回到初始位置」逻辑注册进来，卸载时摘掉。
+   *  host.ts 的 window.__dshPetHome 遍历调用（通知栏「归位」按钮经 evaluateJavascript 触发）。 */
+  homeCallbacks: Array<() => void>;
 } = {
   current: [],
   reload: () => {},
   template: undefined,
+  homeCallbacks: [],
 };
 
 /** 字典命名空间 */

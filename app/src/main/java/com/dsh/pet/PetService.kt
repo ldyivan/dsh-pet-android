@@ -5,8 +5,10 @@ import android.app.NotificationChannel
 import android.app.NotificationManager
 import android.app.PendingIntent
 import android.app.Service
+import android.content.BroadcastReceiver
 import android.content.Context
 import android.content.Intent
+import android.content.IntentFilter
 import android.graphics.PixelFormat
 import android.media.AudioManager
 import android.media.ToneGenerator
@@ -14,6 +16,7 @@ import android.os.Build
 import android.os.Handler
 import android.os.IBinder
 import android.os.Looper
+import android.os.PowerManager
 import android.os.SystemClock
 import android.provider.Settings
 import android.os.VibrationEffect
@@ -30,6 +33,7 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.widget.RemoteViews
 import androidx.webkit.WebViewAssetLoader
 import org.json.JSONArray
 import org.json.JSONObject
@@ -117,10 +121,48 @@ class PetService : Service() {
     private var lastTouchReportAt = 0L
     /** 看门狗只启一次（onStartCommand 可能被反复叫） */
     private var watchdogStarted = false
+    /** 局部 wakelock：灭屏/被划后台后仍能让重启闹钟唤醒 CPU 执行（短持 2s，不长时间占电） */
+    private var wakeLock: PowerManager.WakeLock? = null
+    /** 每分钟重挂保活闹钟（ROM 会清理闹钟，服务活着时周期性续命） */
+    private var reArmRunnable: Runnable? = null
 
     /** 桌宠是否被用户「暂时隐藏」（渲染窗口 GONE + 触摸层收回，服务仍常驻） */
     @Volatile
     private var petHidden = false
+    /** 长按菜单是否打开（JS 经 DshNative.setMenuOpen 上报）。
+     *  打开期间触摸层收到「菜单命中区之外」的触摸时，不转发原始事件给 WebView
+     *  （避免误触宠物），而是换算成 WebView 内坐标注入合成 mousedown，
+     *  触发 JS 侧 document mousedown 处理器：先收子列、再关整树（需求①）。 */
+    @Volatile
+    private var menuOpen = false
+    /** 菜单根元素命中区（屏幕 px，由 applyTouchLayersJson 中的 dsh-pet-menu 命中块记录）。
+     *  外部点击判定：触摸点不在这个矩形内即为「菜单外」。 */
+    @Volatile
+    private var menuRect = IntArray(4) // x, y, w, h
+    private var menuRectReady = false // 首次读到菜单矩形前，点按一律按「菜单内」转发，避免误判外点触发逐级收起
+    /** 菜单捕获层窗口（独立窗口，不占触摸窗口池；菜单打开时铺全屏拦截外部触摸）。 */
+    private var captureView: View? = null
+    private var captureParams: WindowManager.LayoutParams? = null
+    /** 捕获层当前是否已消费本次触摸（避免 UP/CANCEL 重复转发） */
+    @Volatile
+    private var captureConsume = false
+
+    /**
+     * 屏幕开关/解锁广播：部分 ROM 在灭屏、亮屏、解锁时会清理应用闹钟，
+     * 导致看门狗/重启闹钟被抹掉、桌宠再也回不来。这里收到广播就重挂一遍。
+     * （只重挂不拉起：服务还活着时重挂就是续命；进程死了自然由闹钟拉起。）
+     */
+    private val screenKeepAliveReceiver = object : BroadcastReceiver() {
+        override fun onReceive(context: Context, intent: Intent) {
+            val a = intent.action ?: return
+            if (a == Intent.ACTION_SCREEN_ON || a == Intent.ACTION_SCREEN_OFF || a == Intent.ACTION_USER_PRESENT) {
+                if (KeepAlive.isWanted(this@PetService)) {
+                    KeepAlive.scheduleWatchdog(this@PetService)
+                    Log.i("dsh-pet", "屏幕广播 $a → 已重挂看门狗")
+                }
+            }
+        }
+    }
 
     /** 点击音效合成器（懒建，销毁时释放；ToneGenerator 反复 new 会泄漏音频资源） */
     private var tone: ToneGenerator? = null
@@ -130,6 +172,31 @@ class PetService : Service() {
     override fun onCreate() {
         super.onCreate()
         // wm 改成按需取（见 windowHost）：完全体模式下要用无障碍服务的 Context
+        // 屏幕开关广播：注册后收灭屏/亮屏/解锁事件，重挂保活闹钟（见 screenKeepAliveReceiver）
+        try {
+            val f = IntentFilter().apply {
+                addAction(Intent.ACTION_SCREEN_ON)
+                addAction(Intent.ACTION_SCREEN_OFF)
+                addAction(Intent.ACTION_USER_PRESENT)
+            }
+            registerReceiver(screenKeepAliveReceiver, f)
+            Log.i("dsh-pet", "屏幕保活广播已注册")
+        } catch (e: Exception) {
+            Log.w("dsh-pet", "屏幕保活广播注册失败: ${e.message}")
+        }
+        // 保活强化①：短持 PARTIAL_WAKE_LOCK（2 秒），保证灭屏/被划后台后 800ms 重启闹钟能唤醒 CPU 执行，不长时间占电
+        val wl = (getSystemService(POWER_SERVICE) as PowerManager).newWakeLock(PowerManager.PARTIAL_WAKE_LOCK, "dsh-pet:restart-alarm")
+        wl.acquire(2000L)
+        wakeLock = wl
+        // 保活强化②：每分钟重挂保活闹钟。ROM 常清理一次性/重复闹钟，服务活着时周期性续命
+        reArmRunnable = object : Runnable {
+            override fun run() {
+                if (KeepAlive.isWanted(this@PetService)) KeepAlive.scheduleWatchdog(this@PetService)
+                main.postDelayed(this, 60_000L)
+            }
+        }
+        main.postDelayed(reArmRunnable!!, 60_000L)
+        Log.i("dsh-pet", "保活强化：wakelock + 每分钟重挂闹钟循环已启动")
     }
 
     override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
@@ -146,12 +213,27 @@ class PetService : Service() {
         when (action) {
             ACTION_HIDE_PET -> setPetHidden(true)
             ACTION_SHOW_PET -> setPetHidden(false)
+            ACTION_PET_HOME -> {
+                // 归位：与右键菜单「回到初始位置」完全一致（停漫游/移动/抛掷、清拖拽位置、回配置角落）
+                main.post {
+                    webView?.evaluateJavascript("window.__dshPetHome && window.__dshPetHome()", null)
+                }
+                updateForegroundNotification()
+            }
+            ACTION_PET_SIZE_INC -> adjustPetSize(+0.05f)
+            ACTION_PET_SIZE_DEC -> adjustPetSize(-0.05f)
+            ACTION_PET_SIZE_SET -> {
+                val ratio = intent?.getDoubleExtra(EXTRA_PET_SIZE_RATIO, -1.0) ?: -1.0
+                if (ratio > 0) setPetSizeRatio(ratio)
+            }
         }
         // 走到这里说明本次启动是「用户希望桌宠运行」的（启动按钮 / 通知栏动作 / 保活拉起）：
         // 落盘意图（进程被 ROM 杀掉后靠它决定该不该复活），并挂上 15 分钟看门狗。
         // 用户主动停止时由 SettingsActivity.stopPet 清掉这两样，所以不会变成关不掉的进程。
         KeepAlive.setWanted(this, true)
         KeepAlive.scheduleWatchdog(this)
+        // 保活强化：每次被叫起（用户/闹钟/广播）时续一下短 wakelock，保证紧接着的闹钟/广播能唤醒 CPU
+        wakeLock?.let { if (!it.isHeld) it.acquire(2000L) }
         return START_STICKY
     }
 
@@ -191,6 +273,9 @@ class PetService : Service() {
             allowFileAccessFromFileURLs = false
             allowUniversalAccessFromFileURLs = false
             mixedContentMode = android.webkit.WebSettings.MIXED_CONTENT_NEVER_ALLOW
+            cacheMode = android.webkit.WebSettings.LOAD_DEFAULT
+            // 后台/隐藏时由 pauseTimers 冻结 JS 与渲染，这里同时让系统在适当时机降级
+            javaScriptCanOpenWindowsAutomatically = false
         }
         wv.isVerticalScrollBarEnabled = false
         wv.isHorizontalScrollBarEnabled = false
@@ -250,6 +335,7 @@ class PetService : Service() {
      */
     private fun createTouchWindow() {
         for (i in 0 until MAX_TOUCH_LAYERS) addTouchLayer()
+        addCaptureLayer()
     }
 
     private fun addTouchLayer(): View {
@@ -290,6 +376,46 @@ class PetService : Service() {
         touchParamsList.add(p)
         return v
     }
+    /**
+     * 菜单捕获层：独立全屏透明窗口（不占触摸窗口池），菜单打开时铺全屏，
+     * 触摸点落在菜单矩形内 → 正常转发（菜单可操作）；矩形外 → 注入合成 mousedown
+     * 触发 JS 侧 document 处理器逐级收起。初始 1×1 @(0,0)，不挡任何东西。
+     */
+    private fun addCaptureLayer() {
+        val v = View(this)
+        v.setBackgroundColor(0x00000000)
+        v.setOnTouchListener { _, _ -> false }
+        val p = WindowManager.LayoutParams(
+            1,
+            1,
+            overlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT,
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0
+            y = 0
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) {
+                setFitInsetsTypes(0)
+            }
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P) {
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+            }
+        }
+        try {
+            wm.addView(v, p)
+            captureView = v
+            captureParams = p
+        } catch (e: Exception) {
+            Log.w("dsh-pet", "添加菜单捕获层失败: ${e.message}")
+            captureView = null
+            captureParams = null
+        }
+    }
 
     /**
      * 渲染窗口 / 触摸层的窗口类型。
@@ -328,6 +454,16 @@ class PetService : Service() {
      *   /dsh-pet-7340/thumb/     → assets/webm/           （host 转发 realFetch('webm/..') → /assets/webm/..）
      */
     private fun buildAssetLoader(): WebViewAssetLoader {
+        /** 去掉中间的 assetRoot 段："memes/main/xxx.png" → "memes/xxx.png"（多宠共用扁平素材目录时用） */
+        fun stripFirstSegment(p: String): String {
+            // 注意：必须剥掉**中间**的 assetRoot 段（如 "main"），保留首段目录名（memes/pic/webm）
+            // 旧实现 p.substring(i+1) 剥掉的是首段，得到 "main/xxx.png"，永远打不开扁平素材
+            val i1 = p.indexOf('/')
+            if (i1 <= 0) return p
+            val i2 = p.indexOf('/', i1 + 1)
+            if (i2 <= 0 || i2 >= p.length - 1) return p
+            return p.substring(0, i1 + 1) + p.substring(i2 + 1)
+        }
         val mime = mapOf(
             "html" to "text/html", "js" to "text/javascript", "jsonc" to "text/plain",
             "json" to "application/json", "png" to "image/png", "ttf" to "font/ttf",
@@ -337,13 +473,17 @@ class PetService : Service() {
             val rel = path.trimStart('/')
             // assets.open 不接受前导 "/"，root 为空时（=assets 根）只取 rel 本身
             val assetPath = if (root.isEmpty()) rel else "$root/$rel"
-            try {
-                val stream = assets.open(assetPath)
-                val ext = rel.substringAfterLast('.', "").lowercase()
+            fun respond(p: String): WebResourceResponse? = try {
+                val stream = assets.open(p)
+                val ext = p.substringAfterLast('.', "").lowercase()
                 WebResourceResponse(mime[ext] ?: "application/octet-stream", null, stream)
             } catch (e: Exception) {
                 null
             }
+            // 直接按映射表路径打开；失败时去掉 URL 路径首段再试一次：
+            // JS 侧 <img src="/dsh-pet-7340/pic/memes/<assetRoot>/<表情名>.png"> 会带上宠物 id
+            // （主宠="main"），而 assets/memes/ 是扁平目录，首次 open 必失败 → 剥掉 assetRoot 重试
+            respond(assetPath) ?: respond(stripFirstSegment(assetPath))
         }
         return WebViewAssetLoader.Builder()
             .addPathHandler("/assets/", handler(""))                 // → assets 根
@@ -438,6 +578,135 @@ class PetService : Service() {
             Log.w("dsh-pet", "命中区 JSON 解析失败: ${e.message}")
         }
         applyTouchLayerRects(rects)
+    }
+
+    /**
+     * 长按菜单打开状态（JS 经 DshNative.setMenuOpen 上报，需求① 菜单外点击逐级收起）。
+     * 打开时铺一个全屏透明捕获层窗口：触摸点在菜单矩形内 → 正常转发（菜单可操作）；
+     * 在菜单矩形外 → 不转发原始触摸（避免误触宠物/拖拽），只向 WebView 注入合成
+     * mousedown，触发 JS 侧 mh() 的 document mousedown 处理器：先收子列、再关整树。
+     */
+    fun setMenuOpen(open: Boolean) {
+        menuOpen = open
+        main.post {
+            updateCaptureLayer(open)
+        }
+        if (open) {
+            // 菜单刚挂载，读取根元素矩形（归一化比例）供外部点击判定
+            main.post {
+                webView?.evaluateJavascript(
+                    "(function(){var m=document.querySelector('.dsh-pet-menu');" +
+                        "if(!m)return 'null';var r=m.getBoundingClientRect();" +
+                        "return JSON.stringify({x:r.left/window.innerWidth,y:r.top/window.innerHeight," +
+                        "w:r.width/window.innerWidth,h:r.height/window.innerHeight});})()"
+                ) { json ->
+                    if (json == "null" || json.isNullOrBlank()) return@evaluateJavascript
+                    try {
+                        val o = JSONObject(json)
+                        val geo = renderGeometry()
+                        val (sw, sh) = screenSize()
+                        val gx = geo[0]; val gy = geo[1]; val gw = geo[2]; val gh = geo[3]
+                        menuRect = intArrayOf(
+                            (gx + Math.round(o.optDouble("x", 0.0) * gw).toInt())
+                                .coerceIn(0, (sw - 1).coerceAtLeast(0)),
+                            (gy + Math.round(o.optDouble("y", 0.0) * gh).toInt())
+                                .coerceIn(0, (sh - 1).coerceAtLeast(0)),
+                            Math.round(o.optDouble("w", 0.0) * gw).toInt()
+                                .coerceIn(1, (sw).coerceAtLeast(1)),
+                            Math.round(o.optDouble("h", 0.0) * gh).toInt()
+                                .coerceIn(1, (sh).coerceAtLeast(1)),
+                        )
+                    menuRectReady = true
+                } catch (e: Exception) {
+                        Log.w("dsh-pet", "读取菜单矩形失败: ${e.message}")
+                    }
+                }
+            }
+        } else {
+            menuRectReady = false
+        }
+    }
+
+    /** 菜单捕获层：打开铺全屏、关闭收回 1×1（独立窗口，不占触摸窗口池） */
+    private fun updateCaptureLayer(open: Boolean) {
+        val v = captureView ?: return
+        val p = captureParams ?: return
+        if (open) {
+            val (sw, sh) = screenSize()
+            p.x = 0
+            p.y = 0
+            p.width = sw
+            p.height = sh
+            v.setOnTouchListener { view, ev -> onCaptureTouch(view, ev) }
+            try {
+                wm.updateViewLayout(v, p)
+            } catch (e: Exception) {
+                Log.w("dsh-pet", "捕获层铺开失败: ${e.message}")
+            }
+        } else {
+            p.x = 0
+            p.y = 0
+            p.width = 1
+            p.height = 1
+            v.setOnTouchListener { _, _ -> false }
+            try {
+                wm.updateViewLayout(v, p)
+            } catch (e: Exception) {
+                Log.w("dsh-pet", "捕获层收回失败: ${e.message}")
+            }
+        }
+    }
+
+    /** 捕获层触摸分发：菜单外 DOWN → 注入合成 mousedown 让 JS 收起；菜单内 → 正常转发 */
+    private fun onCaptureTouch(view: View, ev: MotionEvent): Boolean {
+        if (!menuOpen) return false
+        when (ev.actionMasked) {
+            MotionEvent.ACTION_DOWN -> {
+                val sx = ev.rawX
+                val sy = ev.rawY
+                // menuRect 未就绪（evaluateJavascript 异步回调还没回来）时，
+                // 一律按「菜单内」转发，避免把菜单内点击误判成外点触发逐级收起
+                val inside = !menuRectReady ||
+                    (sx >= menuRect[0] && sx <= menuRect[0] + menuRect[2] &&
+                        sy >= menuRect[1] && sy <= menuRect[1] + menuRect[3])
+                if (!inside) {
+                    captureConsume = true
+                    injectMenuOutsideClick(sx, sy)
+                } else {
+                    captureConsume = false
+                    forwardTouch(view, ev)
+                }
+                return true
+            }
+            MotionEvent.ACTION_UP, MotionEvent.ACTION_CANCEL -> {
+                val consume = captureConsume
+                captureConsume = false
+                if (!consume) forwardTouch(view, ev)
+                return true
+            }
+            else -> {
+                if (!captureConsume) forwardTouch(view, ev)
+                return true
+            }
+        }
+    }
+
+    /** 注入合成 mousedown（DOWN+UP）到 WebView 指定屏幕坐标，触发 JS 外部点击收起 */
+    /** 菜单外点击注入：向 JS 侧 document dispatch 一个合成 mousedown（捕获阶段）。
+     *  不走 WebView 指针追踪，不会触发菜单容器 mouseleave 导致 200ms 定时器全关。
+     *  JS 侧 mh() 的 x 处理器：!u.contains(target) → 有子列则 c() 收子列，无子列则 _() 关整树。
+     *  所以每次点击外部的效果：先收子列（若有）、再关主菜单（无子列时）——逐级收起。 */
+    private fun injectMenuOutsideClick(sx: Float, sy: Float) {
+        val wv = webView ?: return
+        val script =
+            "document.dispatchEvent(new MouseEvent('mousedown', {" +
+            "bubbles:true, cancelable:true, view:document.defaultView, " +
+            "clientX:" + sx + ", clientY:" + sy + "}))"
+        try {
+            wv.evaluateJavascript(script, null)
+        } catch (e: Exception) {
+            Log.w("dsh-pet", "注入菜单外点击失败: ${e.message}")
+        }
     }
 
     /**
@@ -649,12 +918,50 @@ class PetService : Service() {
     // --------------------------------------------------------- 前台通知
 
     private fun startForegroundSafe() {
-        ensureChannel(getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager)
-        val n = buildForegroundNotification()
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
-            startForeground(FOREGROUND_ID, n, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
-        } else {
-            startForeground(FOREGROUND_ID, n)
+        val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+        ensureChannel(nm)
+        // 先试完整通知（含自定义展开视图）；任一环节失败则降级为最小通知，
+        // 保证 startForeground 成功、服务不崩（闪退根因由全局 DshApp 捕获落盘，
+        // 降级原因也一并写进崩溃日志，下次进设置页可查）。
+        val n = try {
+            buildForegroundNotification()
+        } catch (e: Exception) {
+            appendCrashDiagnosis("buildForegroundNotification 失败(降级最小通知)", e)
+            Notification.Builder(this, CHANNEL_ID)
+                .setContentTitle(getString(R.string.app_name))
+                .setContentText("桌宠运行中 · 通知降级显示")
+                .setOngoing(true)
+                .build()
+        }
+        try {
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.UPSIDE_DOWN_CAKE) {
+                startForeground(FOREGROUND_ID, n, android.content.pm.ServiceInfo.FOREGROUND_SERVICE_TYPE_SPECIAL_USE)
+            } else {
+                startForeground(FOREGROUND_ID, n)
+            }
+        } catch (e: Exception) {
+            // 前台服务注册失败（个别 ROM/权限）：记录但不崩，渲染窗口已单独创建
+            appendCrashDiagnosis("startForeground 失败", e)
+        }
+    }
+    /** 把「没崩但异常」的诊断也写进同一份崩溃日志（filesDir/dshcrash.log，
+     *  与 DshApp 的全局崩溃捕获共用一个文件，设置页统一展示）。 */
+    private fun appendCrashDiagnosis(tag: String, e: Throwable) {
+        Log.e("dsh-pet", tag + ": " + e.javaClass.simpleName + " - " + e.message)
+        try {
+            val ts = System.currentTimeMillis()
+            val sw = java.io.StringWriter()
+            e.printStackTrace(java.io.PrintWriter(sw))
+            val body = "\n===== " + tag + " @" + ts + " =====\n" + sw.toString()
+            // 复用 DshApp 的多路写入，与全局崩溃捕获共用同一份文件
+            val app = application as? DshApp
+            if (app != null) {
+                app.writeCrashLog(body)
+            } else {
+                // 兑底：应用没挂 DshApp 时直接写 filesDir
+                java.io.FileWriter(java.io.File(filesDir, "dshcrash.log"), true).use { w -> w.write(body) }
+            }
+        } catch (ignored: Exception) {
         }
     }
 
@@ -678,16 +985,67 @@ class PetService : Service() {
                 .setAction(if (petHidden) ACTION_SHOW_PET else ACTION_HIDE_PET),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
-        val text = if (petHidden) "桌宠已隐藏，点下方按钮恢复" else "桌宠运行中"
-        return Notification.Builder(this, CHANNEL_ID)
+        val sizePct = Math.round(currentSizeRatio() * 100)
+        val text = if (petHidden) "桌宠已隐藏，点下方按钮恢复" else "桌宠运行中 · 大小 $sizePct%"
+        // 保活状态说明：白名单未开时给提示，引导去电池优化设置页（点通知即跳系统白名单页）
+        // 需求② 归位按钮：与右键菜单「回到初始位置」同效果（JS 侧遍历所有归位回调）
+        val homePi = PendingIntent.getService(
+            this, 3,
+            Intent(this, PetService::class.java).setAction(ACTION_PET_HOME),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        // 需求③ 自定义展开视图：标题/状态 → 「大小：」+ 滑块进度条(ProgressBar) + 百分比。
+        // 系统限制：RemoteViews 无法监听滑动事件，故用 11 个透明点击热区
+        // 叠在进度条上方，点击任意段直接设值；视觉上是连贯的滑块进度条。
+        val rv = RemoteViews(packageName, R.layout.notification_size)
+        rv.setTextViewText(R.id.nt_title, getString(R.string.app_name))
+        rv.setTextViewText(R.id.nt_text, text)
+        // 当前真实百分比（如 50%），随 sizeRatio 刷新
+        val pct = Math.round(currentSizeRatio() * 100)
+        rv.setTextViewText(R.id.nt_size_value, "$pct%")
+        // 纯展示 + 点击热区：进度条显示当前档位，11 个透明热区绑 PendingIntent 设值
+        val ratio = currentSizeRatio()
+        val currentLevel = Math.round(((ratio - 0.40) / 0.05)).toInt().coerceIn(0, 10)
+        rv.setInt(R.id.nt_seekbar, "setProgress", currentLevel)
+        // 11 个透明热区绑定 PendingIntent：携带该档对应比例（0.40 + i*0.05）
+        val segIds = intArrayOf(
+            R.id.nt_seg_1, R.id.nt_seg_2, R.id.nt_seg_3, R.id.nt_seg_4, R.id.nt_seg_5,
+            R.id.nt_seg_6, R.id.nt_seg_7, R.id.nt_seg_8, R.id.nt_seg_9, R.id.nt_seg_10, R.id.nt_seg_11,
+        )
+        for (i in segIds.indices) {
+            val target = 0.40 + i * 0.05
+            val pi = PendingIntent.getService(
+                this,
+                100 + i,
+                Intent(this, PetService::class.java)
+                    .setAction(ACTION_PET_SIZE_SET)
+                    .putExtra(EXTRA_PET_SIZE_RATIO, target),
+                PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+            )
+            rv.setOnClickPendingIntent(segIds[i], pi)
+        }
+        // 展开态按钮：与收起态 action 语义一致（toggle/home/settings）
+        rv.setOnClickPendingIntent(R.id.nt_btn_toggle, togglePi)
+        rv.setOnClickPendingIntent(R.id.nt_btn_home, homePi)
+        rv.setOnClickPendingIntent(R.id.nt_btn_settings, settingsPi)
+        rv.setTextViewText(R.id.nt_btn_toggle, toggleLabel)
+        val builder = Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.star_on)
             .setContentTitle(getString(R.string.app_name))
             .setContentText(text)
             .setContentIntent(settingsPi)
             .setOngoing(true)
+        // 只挂展开视图（setCustomBigContentView）：收起时显示标准视图（图标+标题+按钮），
+        // 展开时显示滑块进度条。不能 setCustomContentView（会替换收起视图导致图标/按钮消失）。
+        builder.setCustomBigContentView(rv)
+        // 底部动作按钮（隐藏/显示、归位、设置、保活提示）
+        return builder
             .addAction(Notification.Action.Builder(null, toggleLabel, togglePi).build())
+            .addAction(Notification.Action.Builder(null, "归位", homePi).build())
             .addAction(Notification.Action.Builder(null, "设置", settingsPi).build())
+
             .build()
+
     }
 
     private fun updateForegroundNotification() {
@@ -696,6 +1054,35 @@ class PetService : Service() {
             nm.notify(FOREGROUND_ID, buildForegroundNotification())
         } catch (e: Exception) {
             Log.w("dsh-pet", "更新常驻通知失败: ${e.message}")
+        }
+    }
+    /** 通知栏「大小」调节：把增减量交给 JS 侧的 window.__dshPetSize(delta)（它负责读/夹取/落盘/刷新），
+     *  成功回调里刷新通知文本显示新百分比。每次步进 0.05（5% 屏宽）。 */
+    private fun adjustPetSize(delta: Float) {
+        val script = "window.__dshPetSize && window.__dshPetSize(" + delta + ")"
+        main.post {
+            webView?.evaluateJavascript(script) { _ ->
+                updateForegroundNotification()
+            }
+        }
+    }
+    /** 通知栏进度条：按档位直接设桌宠大小（JS 侧 __dshPetSize 读/夹取/落盘/刷新）。
+     *  与 adjustPetSize 不同：这里传「目标比例」而非增量，夹取区间同为 0.40~0.90。 */
+    private fun setPetSizeRatio(ratio: Double) {
+        val clamped = ratio.coerceIn(0.40, 0.90)
+        val script = "window.__dshPetSize && window.__dshPetSize(" + clamped + ")"
+        main.post {
+            webView?.evaluateJavascript(script) { _ ->
+                updateForegroundNotification()
+            }
+        }
+    }
+    /** 读当前 sizeRatio（通知文本显示用；读不到回默认 0.42） */
+    private fun currentSizeRatio(): Double {
+        return try {
+            JSONObject(Store.readUiSettings(this)).optDouble("sizeRatio", 0.42).coerceIn(0.40, 0.90)
+        } catch (e: Exception) {
+            0.42
         }
     }
 
@@ -709,8 +1096,16 @@ class PetService : Service() {
             petHidden = hidden
             Companion.isHidden = hidden
             webView?.visibility = if (hidden) View.GONE else View.VISIBLE
+            if (hidden) {
+                // 后台降载：冻结 JS 定时器/渲染与视频解码，多宠同时存在时省电省内存
+                // （WebView.onPause 只停页面，pauseTimers 连共享的 JS 引擎一起冻结）
+                try { webView?.onPause() } catch (e: Exception) { Log.w("dsh-pet", "webview onPause 失败: ${e.message}") }
+                try { webView?.pauseTimers() } catch (e: Exception) { Log.w("dsh-pet", "webview pauseTimers 失败: ${e.message}") }
+            }
             if (!hidden) {
-                // 恢复后让渲染层重新上报命中区（隐藏期间它上报的都被丢掉了）
+                // 恢复后让渲染层重新上报命中区（隐藏期间它上报的都被丢掉了）；并恢复 JS/渲染
+                try { webView?.resumeTimers() } catch (e: Exception) { Log.w("dsh-pet", "webview resumeTimers 失败: ${e.message}") }
+                try { webView?.onResume() } catch (e: Exception) { Log.w("dsh-pet", "webview onResume 失败: ${e.message}") }
                 webView?.evaluateJavascript(
                     "window.__dshReloadConfig && window.__dshReloadConfig()", null
                 )
@@ -820,6 +1215,13 @@ class PetService : Service() {
         touchViews.clear()
         touchParamsList.clear()
         try {
+            captureView?.let { wm.removeView(it) }
+        } catch (e: Exception) {
+            // 已被移除
+        }
+        captureView = null
+        captureParams = null
+        try {
             webView?.destroy()
         } catch (e: Exception) {
             // 已销毁
@@ -918,6 +1320,17 @@ class PetService : Service() {
 
     override fun onDestroy() {
         super.onDestroy()
+        // 注销屏幕保活广播（生命周期与 Service 一致，避免泄漏）
+        try {
+            unregisterReceiver(screenKeepAliveReceiver)
+        } catch (e: Exception) {
+            // 未注册或已注销
+        }
+        // 保活强化收尾：先停自身资源（重挂闹钟循环 + 短 wakelock）
+        reArmRunnable?.let { main.removeCallbacks(it) }
+        reArmRunnable = null
+        wakeLock?.let { if (it.isHeld) it.release() }
+        wakeLock = null
         // 只有「用户主动停止」才清保活闹钟（那时 wanted 已被置 false）；
         // 被系统/ROM 回收时 wanted 仍为 true，闹钟必须留着，否则就再也回不来了。
         if (!KeepAlive.isWanted(this)) KeepAlive.cancelAll(this)
@@ -935,6 +1348,13 @@ class PetService : Service() {
         }
         touchViews.clear()
         touchParamsList.clear()
+        try {
+            captureView?.let { wm.removeView(it) }
+        } catch (e: Exception) {
+            // 已被移除
+        }
+        captureView = null
+        captureParams = null
         webView?.destroy()
         webView = null
         try {
@@ -968,6 +1388,13 @@ class PetService : Service() {
         /** 通知栏动作：暂时隐藏 / 显示桌宠 */
         const val ACTION_HIDE_PET = "com.dsh.pet.action.HIDE_PET"
         const val ACTION_SHOW_PET = "com.dsh.pet.action.SHOW_PET"
+        /** 通知栏动作：归位（与右键菜单「回到初始位置」同一逻辑）/ 大小调节（±0.05 比例） */
+        const val ACTION_PET_HOME = "com.dsh.pet.action.PET_HOME"
+        const val ACTION_PET_SIZE_INC = "com.dsh.pet.action.PET_SIZE_INC"
+        const val ACTION_PET_SIZE_DEC = "com.dsh.pet.action.PET_SIZE_DEC"
+        /** 应用内右键菜单等动作：按目标比例设桌宠大小（EXTRA_PET_SIZE_RATIO，通知栏进度条已改为纯展示） */
+        const val ACTION_PET_SIZE_SET = "com.dsh.pet.action.PET_SIZE_SET"
+        const val EXTRA_PET_SIZE_RATIO = "com.dsh.pet.extra.PET_SIZE_RATIO"
 
         /** 运行态单例引用（设置页保存后据此触发 reloadConfig） */
         @Volatile

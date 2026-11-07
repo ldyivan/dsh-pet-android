@@ -33,6 +33,10 @@ import androidx.core.app.NotificationManagerCompat
 import androidx.core.content.ContextCompat
 import org.json.JSONArray
 import org.json.JSONObject
+import android.content.ClipData
+import android.content.ClipboardManager
+import android.content.Context
+import java.io.File
 
 /**
  * 设置页（唯一可见 Activity）。
@@ -90,6 +94,7 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var updateHint: TextView
     /** 检查中：按钮置灰，避免连点把 GitHub 限额打满 */
     private var checkingUpdate = false
+    // 崩溃日志闭环：启动时若有崩溃日志则自动弹窗展示，可复制(并清空)/手动清空
 
     private val main = Handler(Looper.getMainLooper())
     private val REQ_NOTIFY = 1001
@@ -153,6 +158,10 @@ class SettingsActivity : AppCompatActivity() {
         refreshPermState()
         // 进页面先静默查一次：用户不用点也知道有没有新版（失败只写小字，不弹窗）
         main.postDelayed({ checkUpdate(true) }, 300L)
+        // 崩溃日志闭环：启动时若有日志自动弹窗，无日志不弹
+        if (readCrashLog().isNotBlank()) {
+            main.postDelayed({ showCrashDialog() }, 600L)
+        }
     }
 
     override fun onResume() {
@@ -435,7 +444,6 @@ class SettingsActivity : AppCompatActivity() {
                 ).apply { topMargin = dp(8) },
             )
         })
-
         return ScrollView(this).apply {
             addView(root, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
             setBackgroundColor(0xFFF3F5FB.toInt())
@@ -456,6 +464,127 @@ class SettingsActivity : AppCompatActivity() {
         }
         c.block()
         return c
+    }
+
+    /** 读崩溃日志：与 DshApp 共用同一份文件（外部目录优先，内部兑底），取第一个非空内容 */
+    private fun readCrashLog(): String {
+        val paths = listOfNotNull(
+            getExternalFilesDir(null)?.let { File(it, DshApp.CRASH_LOG_NAME) },
+            File(filesDir, DshApp.CRASH_LOG_NAME),
+        )
+        for (f in paths) {
+            if (f.exists() && f.length() > 0) {
+                val t = try { f.readText() } catch (e: Exception) { "" }
+                if (t.isNotBlank()) return t
+            }
+        }
+        return ""
+    }
+
+
+    /** 复制崩溃日志到剪贴板并清空，为下一次崩溃留干净记录 */
+    private fun copyAndClearCrashLog() {
+        val txt = readCrashLog()
+        if (txt.isBlank()) {
+            Toast.makeText(this, "暂无崩溃日志可复制", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val clipboard = getSystemService(Context.CLIPBOARD_SERVICE) as ClipboardManager
+        clipboard.setPrimaryClip(ClipData.newPlainText("dsh-pet crash log", txt))
+        clearCrashLog()
+        Toast.makeText(this, "已复制到剪贴板并清空，可粘贴给我排查", Toast.LENGTH_SHORT).show()
+
+    }
+    /** modal 弹窗：白卡风格、蓝色 accent、圆角堆栈框，与 APP 风格统一 */
+    private fun showCrashDialog() {
+        val txt = readCrashLog()
+        if (txt.isBlank()) return
+        val entries = txt.split("===== ").size - 1
+
+        // 内容根：圆角白卡
+        val root = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), 0, dp(20), dp(16))
+            background = roundRect(0xFFFFFFFF.toInt(), 20, 0)
+        }
+        // 标题栏
+        val titleRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(16), 0, dp(10))
+        }
+        titleRow.addView(TextView(this).apply {
+            text = "崩溃日志"
+            textSize = 17f
+            setTextColor(0xFF1A73E8.toInt())
+            setPadding(0, 0, dp(10), 0)
+        })
+        val subtitle = TextView(this).apply {
+            text = "共 $entries 条记录"
+            textSize = 12f
+            setTextColor(0xFF7A839A.toInt())
+        }
+        titleRow.addView(subtitle, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        root.addView(titleRow)
+        // 分隔线（用 marginTop 控制间距，避免 setMargins 四参易错）
+        val divider = View(this).apply {
+            setBackgroundColor(0xFFE8ECF4.toInt())
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(1),
+            ).apply { topMargin = dp(10) }
+        }
+        root.addView(divider)
+        // 堆栈滚动区
+        val scroll = ScrollView(this).apply {
+            isVerticalScrollBarEnabled = true
+            isHorizontalScrollBarEnabled = true
+            layoutParams = LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(240),
+            ).apply { topMargin = dp(4) }
+        }
+        scroll.addView(TextView(this).apply {
+            text = txt
+            textSize = 11f
+            setTextColor(0xFF1F2637.toInt())
+            typeface = android.graphics.Typeface.MONOSPACE
+            background = roundRect(0xFFF7F9FD.toInt(), 12, 0xFFDCE2EF.toInt())
+            setPadding(dp(10), dp(8), dp(10), dp(8))
+        })
+        root.addView(scroll)
+        // 按钮行
+        val btnRow = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(14), 0, 0)
+        }
+        val copyBtn = pill("复制并清空", true) { }
+        val clearBtn = pill("清空", false) { }
+        btnRow.addView(copyBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        btnRow.addView(clearBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(8) })
+        root.addView(btnRow)
+
+        // 透明 Dialog 宿主：遮罩 40%、宽 86% 屏、圆角白卡
+        var dlgRef: android.app.Dialog? = null
+        val dlg = android.app.Dialog(this@SettingsActivity).apply {
+            requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+            setContentView(root)
+            window?.apply {
+                setDimAmount(0.4f)
+                setBackgroundDrawable(android.graphics.drawable.ColorDrawable(0x00000000))
+                val w = (resources.displayMetrics.widthPixels * 0.86).toInt()
+                setLayout(w, ViewGroup.LayoutParams.WRAP_CONTENT)
+            }
+        }
+        dlgRef = dlg
+        // 让按钮复制/清空后能关闭弹窗
+        copyBtn.setOnClickListener { copyAndClearCrashLog(); dlgRef?.dismiss() }
+        clearBtn.setOnClickListener { clearCrashLog(); dlgRef?.dismiss() }
+        dlg.show()
+    }
+    private fun clearCrashLog() {
+        (application as? DshApp)?.clearCrashLog()
+        try { getExternalFilesDir(null)?.let { File(it, DshApp.CRASH_LOG_NAME).delete() } }
+        catch (ignored: Exception) { }
+        try { File(filesDir, DshApp.CRASH_LOG_NAME).delete() } catch (ignored: Exception) { }
     }
 
     private fun roundRect(fill: Int, radiusDp: Int, stroke: Int): GradientDrawable =

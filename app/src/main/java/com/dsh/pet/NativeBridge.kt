@@ -98,6 +98,13 @@ class NativeBridge(private val svc: PetService) {
     /** 打开原生设置页 */
     @JavascriptInterface
     fun openSettings() = svc.openSettingsActivity()
+    /**
+     * 菜单打开状态上报（需求①：菜单外点击逐级收起）。
+     * 菜单打开期间，Kotlin 维护全屏捕获层；菜单外点击会被换算成合成 mousedown
+     * 注入 WebView，触发 JS 侧 mh() 的 document mousedown 处理器逐级收起。
+     */
+    @JavascriptInterface
+    fun setMenuOpen(open: Boolean) = svc.setMenuOpen(open)
 
     /** 输入框聚焦 / 失焦：切换渲染窗口的可聚焦性并唤起或收起输入法 */
     @JavascriptInterface
