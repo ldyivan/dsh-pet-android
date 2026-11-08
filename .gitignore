@@ -26,3 +26,7 @@ renderer/package-lock.json
 # 系统文件
 .DS_Store
 Thumbs.db
+
+# 开发备份文件（版本回退快照，不进仓库）
+*.bak_*
+*.bak_sleep

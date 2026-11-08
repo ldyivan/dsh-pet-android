@@ -62,12 +62,33 @@ const options = {
   ],
 };
 
+const baifanOptions = {
+  entryPoints: [abs('android/baifan-entry.ts')],
+  outfile: abs('dist/baifan.js'),
+  bundle: true,
+  format: 'iife',
+  platform: 'browser',
+  target: ['es2020', 'chrome100'],
+  define: {
+    'process.env.NODE_ENV': dev ? '"development"' : '"production"',
+  },
+  minify: !dev,
+  sourcemap: dev ? 'inline' : true,
+  legalComments: 'eof',
+  charset: 'utf8',
+  logLevel: 'info',
+};
 if (watch) {
   const ctx = await context(options);
   await ctx.watch();
-  console.log('[build] watching…');
+  const baifanCtx = await context(baifanOptions);
+  await baifanCtx.watch();
+  console.log('[build] watching dsh-pet.js + baifan.js…');
 } else {
   const result = await build(options);
   console.log('[build] done → dist/dsh-pet.js');
   if (result.errors.length) process.exit(1);
+  const baifanResult = await build(baifanOptions);
+  console.log('[build] done → dist/baifan.js');
+  if (baifanResult.errors.length) process.exit(1);
 }

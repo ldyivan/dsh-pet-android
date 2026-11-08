@@ -105,8 +105,18 @@ class NativeBridge(private val svc: PetService) {
      */
     @JavascriptInterface
     fun setMenuOpen(open: Boolean) = svc.setMenuOpen(open)
-
     /** 输入框聚焦 / 失焦：切换渲染窗口的可聚焦性并唤起或收起输入法 */
     @JavascriptInterface
     fun setFocusMode(on: Boolean) = svc.setFocusMode(on)
+    /**
+     * 穿透模式开关：true = 所有触摸层收回 1×1（屏幕整块穿透给下层 App），
+     * false = 恢复正常触摸层跟随。
+     * 角落小按钮（48×48）始终可点，用于退出穿透。
+     */
+    @JavascriptInterface
+    fun setClickThrough(on: Boolean) = svc.setClickThrough(on)
+
+    /** 吃白饭运行状态上报（JS 开演/收场边界调用）：通知栏按钮标签据此动态切换「吃白饭↔停止吃白饭」。 */
+    @JavascriptInterface
+    fun setBaifanRunning(on: Boolean) = svc.setBaifanRunning(on)
 }

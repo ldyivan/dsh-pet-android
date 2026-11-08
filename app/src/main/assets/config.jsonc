@@ -241,6 +241,8 @@
       }
     ],
     // 转向动画池（数组；每一项都必须是“播完会翻转朝向”的动画，如东张西望）
+    // 「吃白饭」玩法：5 槽位动画名，顺序即玩法契约（descend/chase/expect/eatBowl/eatBall）
+    "baifan": ["开心小跑", "侧身急躁跑", "期待开饭", "吃饭·碗饭", "吃饭团"],
     "turn": ["东张西望"],
     // 拖拽动画池（数组；每一项都必须是“被无形抓起悬空”的姿势）
     "drag": ["被鼠标拖拽悬空反馈"],
@@ -256,14 +258,15 @@
     // 未写的字段取 default。minDist/maxDist=单次行进距离(px)——以「基准宠物宽 462px」为准，
     //   运行时按 实际size/462 等比缩放（小宠物挪小步、大宠物挪大步，与人物大小匹配）；
     // margin=贴边安全距(px，不随缩放)、leadSec/tailSec=动画首尾各多少秒原地不动。
-    "moves": {
-      "default": { "minDist": 60, "maxDist": 240, "margin": 20, "leadSec": 2, "tailSec": 2 },
-      "actions": [
-        { "name": "螃蟹走路" },
-        { "name": "原地漂浮踏步", "params": { "minDist": 40, "maxDist": 120 } },
-        { "name": "原地左转奔跑", "params": { "minDist": 120, "maxDist": 320, "leadSec": 1.75, "tailSec": 4.8 } }
-      ]
-    },
+"moves": {
+       "default": { "minDist": 60, "maxDist": 240, "margin": 20, "leadSec": 2, "tailSec": 2 },
+       "actions": [
+         { "name": "螃蟹走路" },
+         { "name": "原地漂浮踏步", "params": { "minDist": 40, "maxDist": 120 } },
+         { "name": "原地左转奔跑", "params": { "minDist": 120, "maxDist": 320, "leadSec": 1.75, "tailSec": 4.8 } },
+         { "name": "侧身急躁跑", "params": { "minDist": 180, "maxDist": 380, "leadSec": 1.2, "tailSec": 1.2 } }
+       ]
+     },
     // 随机动作：分类池。weight 为该分类出现权重；noMirror: true 表示“带文字、镜像会颠倒，
     // 宠物面向右（被镜像）时不播放该类”。所有分类 weight 合计应与 animationWeights 里
     // 顶层权重和的余量（100 − idle − turn − move）相等。
@@ -272,8 +275,8 @@
         "悠闲哼歌", "超大伸懒腰", "原地敲击桌面互动", "原地重力下蹲压缩", "哈欠连天",
         "原地小憩沉眠", "女仆屈膝礼仪", "被吓一跳", "小幅度原地360度旋转展示",
         "偷吃零食被抓住", "用鲸鱼尾巴拍打地面", "打瞌睡被惊醒", "照镜子", "整体换装试色",
-        "轻快记录", "写代码", "摇扇纳凉", "晨间刷牙",
-         "侧身急躁跑", "开心小跑"
+"轻快记录", "写代码", "摇扇纳凉", "晨间刷牙",
+         "开心小跑"
       ] },
       { "id": "玩耍", "weight": 20, "actions": [
         "原地专心玩魔方", "原地蹲下玩玩具汽车", "鲸鱼吐泡泡特效", "原地跳跃抓碎头顶物品",

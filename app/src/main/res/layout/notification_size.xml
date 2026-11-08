@@ -186,7 +186,7 @@
             android:background="@drawable/nt_btn_bg" />
 
         <TextView
-            android:id="@+id/nt_btn_settings"
+            android:id="@+id/nt_btn_baifan"
             android:layout_width="0dp"
             android:layout_height="wrap_content"
             android:layout_weight="1"
@@ -194,7 +194,21 @@
             android:paddingTop="6dp"
             android:paddingBottom="6dp"
             android:gravity="center"
-            android:text="设置"
+            android:text="吃白饭"
+            android:textSize="12sp"
+            android:textColor="#FFFFFFFF"
+            android:background="@drawable/nt_btn_bg" />
+
+        <TextView
+            android:id="@+id/nt_btn_ct"
+            android:layout_width="0dp"
+            android:layout_height="wrap_content"
+            android:layout_weight="1"
+            android:layout_marginStart="6dp"
+            android:paddingTop="6dp"
+            android:paddingBottom="6dp"
+            android:gravity="center"
+            android:text="穿透"
             android:textSize="12sp"
             android:textColor="#FFFFFFFF"
             android:background="@drawable/nt_btn_bg" />

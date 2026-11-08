@@ -140,12 +140,52 @@ class PetService : Service() {
     @Volatile
     private var menuRect = IntArray(4) // x, y, w, h
     private var menuRectReady = false // 首次读到菜单矩形前，点按一律按「菜单内」转发，避免误判外点触发逐级收起
-    /** 菜单捕获层窗口（独立窗口，不占触摸窗口池；菜单打开时铺全屏拦截外部触摸）。 */
+/** 菜单捕获层窗口（独立窗口，不占触摸窗口池；菜单打开时铺全屏拦截外部触摸）。 */
     private var captureView: View? = null
     private var captureParams: WindowManager.LayoutParams? = null
     /** 捕获层当前是否已消费本次触摸（避免 UP/CANCEL 重复转发） */
     @Volatile
     private var captureConsume = false
+
+    /** 穿透模式：true = 触摸层全部收回 1×1，屏幕整块穿透给下层 App（宠物仍渲染但不可交互）。 */
+    @Volatile
+    private var clickThrough = false
+
+    /** 穿透模式开关：true = 所有触摸层收回 1×1（屏幕整块穿透给下层 App）；false = 恢复正常跟随。
+     *  退出靠通知栏「穿透/停止穿透」按钮（toggleClickThrough），不再铺屏幕角标。 */
+    fun setClickThrough(on: Boolean) {
+        clickThrough = on
+        main.post {
+            if (on) {
+                for (i in touchViews.indices) {
+                    val p = touchParamsList[i]
+                    p.x = 0; p.y = 0; p.width = 1; p.height = 1
+                    try { wm.updateViewLayout(touchViews[i], p) } catch (_: Exception) {}
+                }
+                Log.i("dsh-pet", "穿透模式已开启（触摸层收回，屏幕穿透）")
+            } else {
+                Log.i("dsh-pet", "穿透模式已关闭（恢复正常触摸）")
+            }
+        }
+    }
+
+    /** 穿透模式 toggle（通知栏按钮调用）：翻转状态 + 刷新通知栏按钮标签。 */
+    fun toggleClickThrough() {
+        setClickThrough(!clickThrough)
+        updateForegroundNotification()
+    }
+
+    /** 吃白饭玩法是否在跑（JS 经 DshNative.setBaifanRunning 上报，通知栏「吃白饭/停止吃白饭」按钮标签据此动态切换）。 */
+    @Volatile
+    private var baifanRunning = false
+
+    /** 吃白饭运行状态上报（JS 开演/收场边界调用）：更新字段 + 刷新通知栏按钮标签。幂等（同状态不重刷）。 */
+    fun setBaifanRunning(on: Boolean) {
+        if (baifanRunning == on) return
+        baifanRunning = on
+        Log.i("dsh-pet", "吃白饭状态上报: " + if (on) "开（通知按钮→停止吃白饭）" else "停（通知按钮→吃白饭）")
+        updateForegroundNotification()
+    }
 
     /**
      * 屏幕开关/解锁广播：部分 ROM 在灭屏、亮屏、解锁时会清理应用闹钟，
@@ -159,6 +199,17 @@ class PetService : Service() {
                 if (KeepAlive.isWanted(this@PetService)) {
                     KeepAlive.scheduleWatchdog(this@PetService)
                     Log.i("dsh-pet", "屏幕广播 $a → 已重挂看门狗")
+                }
+                // 吃白饭玩法省电：灭屏自动暂停、亮屏（解锁）自动恢复。
+                // JS 侧 __dshBaifanPause/Resume 幂等（未在跑/非自动暂停态时是 no-op），
+                // 直接对 WebView 调，服务被杀时 WebView 为 null 自动跳过。
+                main.post {
+                    when (a) {
+                        Intent.ACTION_SCREEN_OFF ->
+                            webView?.evaluateJavascript("window.__dshBaifanPause && window.__dshBaifanPause()", null)
+                        Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT ->
+                            webView?.evaluateJavascript("window.__dshBaifanResume && window.__dshBaifanResume()", null)
+                    }
                 }
             }
         }
@@ -226,6 +277,9 @@ class PetService : Service() {
                 val ratio = intent?.getDoubleExtra(EXTRA_PET_SIZE_RATIO, -1.0) ?: -1.0
                 if (ratio > 0) setPetSizeRatio(ratio)
             }
+            ACTION_BAIFAN -> startBaifan()
+            ACTION_BAIFAN_STOP -> stopBaifan()
+            ACTION_CLICK_THROUGH -> toggleClickThrough()
         }
         // 走到这里说明本次启动是「用户希望桌宠运行」的（启动按钮 / 通知栏动作 / 保活拉起）：
         // 落盘意图（进程被 ROM 杀掉后靠它决定该不该复活），并挂上 15 分钟看门狗。
@@ -234,6 +288,11 @@ class PetService : Service() {
         KeepAlive.scheduleWatchdog(this)
         // 保活强化：每次被叫起（用户/闹钟/广播）时续一下短 wakelock，保证紧接着的闹钟/广播能唤醒 CPU
         wakeLock?.let { if (!it.isHeld) it.acquire(2000L) }
+        // 通知栏自愈：任何一次被叫起（设置页启动 / 点任意通知按钮 / 保活拉起）都强制用当前进程代码
+        // 重建常驻通知。覆盖安装不会杀掉正在跑的前台服务进程，旧进程的 ongoing 通知会一直挂着不刷新
+        // （v1.2.17 通知栏按钮不更新的根因）；这条让点任意旧通知按钮 → startService → 这里重刷，
+        // 一旦运行的是新代码进程，通知即刻变成最新布局，无需手动停服务。
+        updateForegroundNotification()
         return START_STICKY
     }
 
@@ -722,6 +781,8 @@ class PetService : Service() {
         lastTouchReportAt = SystemClock.uptimeMillis()
         main.post {
             if (touchViews.isEmpty()) return@post
+            // 穿透模式：忽略所有 JS 上报，保持 1×1（屏幕整块穿透给下层 App）
+            if (clickThrough) return@post
             val (sw, sh) = screenSize()
             val geo = renderGeometry()
             val gx = geo[0]
@@ -966,11 +1027,12 @@ class PetService : Service() {
     }
 
     /**
-     * 常驻通知：标题 + 状态 + 两个动作（显示/隐藏桌宠、设置）。
+     * 常驻通知：标题 + 状态 + 4 个动作（显示/隐藏、归位、吃白饭 toggle、穿透 toggle）。
      *
      * 「暂时隐藏」在渲染层是把 display 改成 none——命中区没了、气泡也没了，宠物就彻底看不见。
      * 手机上没有右键菜单可点、也没有桌面可以去翻，**通知栏就是唯一还摸得到的入口**，
      * 所以这里必须给一个能把它叫回来的按钮，否则用户只能去设置页停服务再开。
+     * 通知正文带当前 versionName，覆盖安装后用于一眼确认是不是新代码进程在发通知。
      */
     private fun buildForegroundNotification(): Notification {
         val settingsPi = PendingIntent.getActivity(
@@ -986,12 +1048,30 @@ class PetService : Service() {
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         val sizePct = Math.round(currentSizeRatio() * 100)
-        val text = if (petHidden) "桌宠已隐藏，点下方按钮恢复" else "桌宠运行中 · 大小 $sizePct%"
+        // 把当前 versionName 写进通知文本：一眼确认此刻发通知的是新代码进程还是旧进程
+        // （覆盖安装后若通知里仍是旧版本号/无版本，说明是旧进程的 ongoing 通知未刷掉）。
+        val ver = try { packageManager.getPackageInfo(packageName, 0).versionName } catch (e: Exception) { "?" }
+        val text = if (petHidden) "桌宠已隐藏 · v$ver" else "桌宠运行中 · v$ver · 大小 $sizePct%"
         // 保活状态说明：白名单未开时给提示，引导去电池优化设置页（点通知即跳系统白名单页）
         // 需求② 归位按钮：与右键菜单「回到初始位置」同效果（JS 侧遍历所有归位回调）
         val homePi = PendingIntent.getService(
             this, 3,
             Intent(this, PetService::class.java).setAction(ACTION_PET_HOME),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        // 「吃白饭」toggle 按钮：触发 JS 侧 window.__dshBaifanToggle（在跑→停、没跑→开）
+        val baifanPi = PendingIntent.getService(
+            this, 4,
+            Intent(this, PetService::class.java).setAction(ACTION_BAIFAN),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
+        )
+        // 「吃白饭/停止吃白饭」toggle 按钮：标签随 baifanRunning（JS 经 setBaifanRunning 上报）动态切换
+        val baifanLabel = if (baifanRunning) "停止吃白饭" else "吃白饭"
+        // 「穿透/停止穿透」toggle 按钮：翻转点击穿透模式
+        val ctLabel = if (clickThrough) "停止穿透" else "穿透"
+        val ctPi = PendingIntent.getService(
+            this, 6,
+            Intent(this, PetService::class.java).setAction(ACTION_CLICK_THROUGH),
             PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT,
         )
         // 需求③ 自定义展开视图：标题/状态 → 「大小：」+ 滑块进度条(ProgressBar) + 百分比。
@@ -1024,11 +1104,14 @@ class PetService : Service() {
             )
             rv.setOnClickPendingIntent(segIds[i], pi)
         }
-        // 展开态按钮：与收起态 action 语义一致（toggle/home/settings）
+        // 展开态按钮：与收起态 action 语义一致（toggle/归位/吃白饭/穿透）
         rv.setOnClickPendingIntent(R.id.nt_btn_toggle, togglePi)
         rv.setOnClickPendingIntent(R.id.nt_btn_home, homePi)
-        rv.setOnClickPendingIntent(R.id.nt_btn_settings, settingsPi)
+        rv.setOnClickPendingIntent(R.id.nt_btn_baifan, baifanPi)
+        rv.setOnClickPendingIntent(R.id.nt_btn_ct, ctPi)
         rv.setTextViewText(R.id.nt_btn_toggle, toggleLabel)
+        rv.setTextViewText(R.id.nt_btn_baifan, baifanLabel)
+        rv.setTextViewText(R.id.nt_btn_ct, ctLabel)
         val builder = Notification.Builder(this, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.star_on)
             .setContentTitle(getString(R.string.app_name))
@@ -1038,14 +1121,14 @@ class PetService : Service() {
         // 只挂展开视图（setCustomBigContentView）：收起时显示标准视图（图标+标题+按钮），
         // 展开时显示滑块进度条。不能 setCustomContentView（会替换收起视图导致图标/按钮消失）。
         builder.setCustomBigContentView(rv)
-        // 底部动作按钮（隐藏/显示、归位、设置、保活提示）
+        // 底部动作按钮：Android 最多显示 3 个，第 4+ 个折叠进「…」
+        // 吃白饭 toggle + 穿透 toggle 各占 1 个；显示/隐藏 + 归位占 2 个
         return builder
             .addAction(Notification.Action.Builder(null, toggleLabel, togglePi).build())
             .addAction(Notification.Action.Builder(null, "归位", homePi).build())
-            .addAction(Notification.Action.Builder(null, "设置", settingsPi).build())
-
+            .addAction(Notification.Action.Builder(null, baifanLabel, baifanPi).build())
+            .addAction(Notification.Action.Builder(null, ctLabel, ctPi).build())
             .build()
-
     }
 
     private fun updateForegroundNotification() {
@@ -1074,6 +1157,26 @@ class PetService : Service() {
         main.post {
             webView?.evaluateJavascript(script) { _ ->
                 updateForegroundNotification()
+            }
+        }
+    }
+    /** 通知栏「吃白饭」：触发 JS 侧 window.__dshBaifanStart（baifan.js 独立入口）。
+     *  睡眠中会被 baifan.js 内部探针拒绝；玩法期间动画暂停由 lock 机制天然满足。 */
+    private fun startBaifan() {
+        val script = "window.__dshBaifanToggle && window.__dshBaifanToggle()"
+        main.post {
+            webView?.evaluateJavascript(script) { _ ->
+                Log.i("dsh-pet", "吃白饭 toggle 已触发（在跑→停、没跑→开）")
+            }
+        }
+    }
+
+    /** 停止吃白饭（通知栏「停止吃白饭」按钮触发 JS 侧 window.__dshBaifanStop）。 */
+    private fun stopBaifan() {
+        val script = "window.__dshBaifanStop && window.__dshBaifanStop()"
+        main.post {
+            webView?.evaluateJavascript(script) { _ ->
+                Log.i("dsh-pet", "停止吃白饭已触发")
             }
         }
     }
@@ -1394,6 +1497,12 @@ class PetService : Service() {
         const val ACTION_PET_SIZE_DEC = "com.dsh.pet.action.PET_SIZE_DEC"
         /** 应用内右键菜单等动作：按目标比例设桌宠大小（EXTRA_PET_SIZE_RATIO，通知栏进度条已改为纯展示） */
         const val ACTION_PET_SIZE_SET = "com.dsh.pet.action.PET_SIZE_SET"
+        /** 通知栏动作：吃白饭（触发 JS 侧 window.__dshBaifanStart，睡眠中会被拒绝） */
+        const val ACTION_BAIFAN = "com.dsh.pet.action.BAIFAN"
+        /** 通知栏动作：停止吃白饭（触发 JS 侧 window.__dshBaifanStop） */
+        const val ACTION_BAIFAN_STOP = "com.dsh.pet.action.BAIFAN_STOP"
+        /** 通知栏动作：穿透/停止穿透 toggle */
+        const val ACTION_CLICK_THROUGH = "com.dsh.pet.action.CLICK_THROUGH"
         const val EXTRA_PET_SIZE_RATIO = "com.dsh.pet.extra.PET_SIZE_RATIO"
 
         /** 运行态单例引用（设置页保存后据此触发 reloadConfig） */
