@@ -31,10 +31,13 @@
         android:theme="@style/Theme.DshPet">
 
         <!-- 设置页（唯一可见 Activity） -->
+        <!-- taskAffinity=""：独立任务。配合「从最近任务隐藏」开关（window.setExcludeFromRecents），
+             让本应用卡片不进最近任务列表——桌宠在桌面常显，唯一可见界面是设置页，藏掉它就不容易被误划掉后台 -->
         <activity
             android:name=".SettingsActivity"
             android:exported="true"
-            android:label="@string/app_name">
+            android:label="@string/app_name"
+            android:taskAffinity="">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />

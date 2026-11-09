@@ -161,6 +161,55 @@ object KeepAlive {
         }
     }
 
+    // ------------------------------------------------------------ 隐藏最近任务
+
+    private const val KEY_HIDE_TASK = "hide_from_recents"
+
+    /** 是否开启「从最近任务隐藏」（本应用卡片不进最近任务列表，减少被误划掉后台）。默认开。 */
+    fun isHiddenFromRecents(ctx: Context): Boolean = try {
+        prefs(ctx).getBoolean(KEY_HIDE_TASK, true)
+    } catch (e: Exception) {
+        true
+    }
+
+    fun setHiddenFromRecents(ctx: Context, hidden: Boolean) {
+        try {
+            prefs(ctx).edit().putBoolean(KEY_HIDE_TASK, hidden).apply()
+        } catch (e: Exception) {
+            Log.w(TAG, "保存「隐藏最近任务」开关失败: ${e.message}")
+        }
+    }
+
+    /**
+     * 把当前 App 的任务从最近任务列表里剔除（与 com.dshpet.android 1.8.1 同款机制：
+     * `ActivityManager.getAppTasks()` + `AppTask.setExcludeFromRecents(true)`）。
+     *
+     * 需要 Activity 的 window，故接收 [activity]。桌宠本身在桌面常显、不进任务列表，
+     * 唯一可见界面是设置页——藏掉它，用户就不容易在"多任务"里误划掉后台。
+     *
+     * 注意：`getAppTasks()` 在部分 ROM 可能返回空（尤其 Activity 处于独立 taskAffinity 时），
+     * 因此同时叠加 `window.setExcludeFromRecents` 兜底，两条一起确保"藏得住"。
+     */
+    fun applyHideFromRecents(activity: android.app.Activity, hidden: Boolean) {
+        // 与 com.dshpet.android 1.8.1 同款正路：ActivityManager.getAppTasks() →
+        // AppTask.setExcludeFromRecents（API 21+ 稳定）。把本应用任务卡片从最近任务剔除，
+        // 桌宠本身在桌面常显、不进任务列表，唯一可见界面是设置页，藏掉就不容易被误划。
+        // 部分 ROM getAppTasks 返回空时逐条 try，不影响其它保活。
+        try {
+            val am = activity.getSystemService(Context.ACTIVITY_SERVICE) as? android.app.ActivityManager ?: return
+            for (t in am.appTasks) {
+                // 按包名精确匹配本应用任务；个别 ROM 拿不到 baseActivity 时兜底对首个任务置位
+                val mine = t.taskInfo.baseActivity?.packageName == activity.packageName
+                if (mine) t.setExcludeFromRecents(hidden)
+            }
+            if (am.appTasks.none { it.taskInfo.baseActivity?.packageName == activity.packageName }) {
+                am.appTasks.firstOrNull()?.let { it.setExcludeFromRecents(hidden) }
+            }
+        } catch (e: Exception) {
+            Log.w(TAG, "AppTask.setExcludeFromRecents 失败: ${e.message}")
+        }
+    }
+
     // ------------------------------------------------------------ 系统级开关
 
     /** 是否已在电池优化白名单里（低版本没有这个机制，按已允许处理） */

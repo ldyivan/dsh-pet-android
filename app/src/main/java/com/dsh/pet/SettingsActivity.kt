@@ -72,6 +72,10 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var batteryBtn: Button
     private lateinit var autoStartBtn: Button
     private lateinit var keepAliveHint: TextView
+    /** 「从最近任务隐藏」开关（防误删后台，com.dshpet.android 1.8.1 同款 setExcludeFromRecents 机制） */
+    private lateinit var hideTaskSwitch: Switch
+    /** 「台词库含内置默认」组合开关：勾选 = 自定义 + 默认库组合；不勾选 = 仅自定义（留空仍自动用默认库） */
+    private lateinit var sayingsCombineSwitch: Switch
 
     private lateinit var sizeSeek: SeekBar
     private lateinit var sizeVal: TextView
@@ -162,6 +166,10 @@ class SettingsActivity : AppCompatActivity() {
         loadAiSettings()
         loading = false
         refreshPermState()
+        // 应用「隐藏最近任务」持久化状态（用户之前开过开关，重启后仍不进最近任务）
+        if (KeepAlive.isHiddenFromRecents(this)) {
+            KeepAlive.applyHideFromRecents(this, true)
+        }
         // 进页面先静默查一次：用户不用点也知道有没有新版（失败只写小字，不弹窗）
         main.postDelayed({ checkUpdate(true) }, 300L)
         // 崩溃日志闭环：启动时若有日志自动弹窗，无日志不弹
@@ -276,7 +284,7 @@ class SettingsActivity : AppCompatActivity() {
         // ---------------- 后台保活 ----------------
         root.addView(card {
             addView(sectionTitle("后台保活"))
-            addView(desc("从最近任务划掉本应用后，系统会把桌宠连进程一起清掉。下面两项是系统级的「允许」，开着才不会掉。"))
+            addView(desc("保持后台运行，防止被系统清理。"))
 
             batteryBtn = pill("电池优化", false) { KeepAlive.requestIgnoreBattery(this@SettingsActivity) }
             addView(
@@ -294,6 +302,29 @@ class SettingsActivity : AppCompatActivity() {
                 ).apply { topMargin = dp(8) },
             )
 
+            // 「从最近任务隐藏」开关：开启后本应用卡片不进最近任务列表，防误划掉后台
+            // （桌宠在桌面常显，唯一可见界面是设置页，藏掉就不容易被误删）
+            hideTaskSwitch = Switch(this@SettingsActivity).apply {
+                text = "从最近任务隐藏（防误删后台）"
+                textSize = 14f
+                setTextColor(0xFF2A3244.toInt())
+                setPadding(0, dp(8), 0, dp(2))
+                isChecked = KeepAlive.isHiddenFromRecents(this@SettingsActivity)
+                setOnCheckedChangeListener { _, checked ->
+                    if (loading) return@setOnCheckedChangeListener
+                    KeepAlive.setHiddenFromRecents(this@SettingsActivity, checked)
+                    KeepAlive.applyHideFromRecents(this@SettingsActivity, checked)
+                    if (checked) {
+                        Toast.makeText(
+                            this@SettingsActivity,
+                            "已隐藏：本应用卡片不再出现在最近任务，可从设置页随时回来",
+                            Toast.LENGTH_LONG,
+                        ).show()
+                    }
+                }
+            }
+            addView(hideTaskSwitch)
+
             keepAliveHint = desc("")
             addView(keepAliveHint)
         })
@@ -301,7 +332,7 @@ class SettingsActivity : AppCompatActivity() {
         // ---------------- 外观 ----------------
         root.addView(card {
             addView(sectionTitle("外观"))
-            addView(desc("调完立刻生效，不用点保存。"))
+            addView(desc("调整即时生效，无需保存。"))
 
             sizeVal = valueLabel()
             addView(labelRow("显示大小", sizeVal))
@@ -349,13 +380,13 @@ class SettingsActivity : AppCompatActivity() {
             addView(soundSwitch)
 
             addView(TextView(this@SettingsActivity).apply {
-                text = "点击台词库（每行一句，点宠物时随机弹一句；留空则不弹）"
+                text = "点击台词库（每行一句）"
                 textSize = 12.5f
                 setTextColor(0xFF7A839A.toInt())
                 setPadding(0, dp(10), 0, dp(6))
             })
             sayingsEdit = EditText(this@SettingsActivity).apply {
-                hint = "主人，欢迎回来～\n今天也要好好休息哦\n需要我帮忙吗？"
+                hint = "留空则用内置默认台词库"
                 setHintTextColor(0xFFAEB6C6.toInt())
                 setTextColor(0xFF1F2637.toInt())
                 textSize = 14f
@@ -375,6 +406,24 @@ class SettingsActivity : AppCompatActivity() {
                 })
             }
             addView(sayingsEdit)
+
+            // 组合开关：勾选 = 内置默认库 + 自定义一起用；不勾选 = 仅用自定义（留空仍自动回落默认库）
+            sayingsCombineSwitch = Switch(this@SettingsActivity).apply {
+                text = "台词库含内置默认"
+                textSize = 14f
+                setTextColor(0xFF2A3244.toInt())
+                setPadding(0, dp(8), 0, dp(2))
+                isChecked = try {
+                    JSONObject(Store.readUiSettings(this@SettingsActivity)).optBoolean("sayingsCombine", false)
+                } catch (e: Exception) {
+                    false
+                }
+                setOnCheckedChangeListener { _, checked ->
+                    if (loading) return@setOnCheckedChangeListener
+                    onUiChanged()
+                }
+            }
+            addView(sayingsCombineSwitch)
         })
 
         // ---------------- AI ----------------
@@ -389,7 +438,7 @@ class SettingsActivity : AppCompatActivity() {
             }
             addView(aiEnabled)
 
-            addView(desc("OpenAI 兼容接口。填完自动保存，切回桌面即可用（无需重启桌宠）。"))
+            addView(desc("OpenAI 兼容接口，填写自动保存。"))
 
             baseUrlEdit = input("接口地址", "https://api.openai.com/v1")
             addView(baseUrlEdit)
@@ -434,7 +483,7 @@ class SettingsActivity : AppCompatActivity() {
             addView(btnRow)
 
             updateHint = TextView(this@SettingsActivity).apply {
-                text = "点「检查更新」查询 GitHub 上有没有新版本。"
+                text = "检查 GitHub 上是否有新版本。"
                 textSize = 12.5f
                 setTextColor(0xFF7A839A.toInt())
                 setPadding(0, dp(8), 0, dp(4))
@@ -1046,6 +1095,7 @@ class SettingsActivity : AppCompatActivity() {
             if (s.isNotEmpty()) lines.add(s)
         }
         sayingsEdit.setText(lines.joinToString("\n"))
+        sayingsCombineSwitch.isChecked = j.optBoolean("sayingsCombine", false)
         // 量程/文案取决于开关与无障碍状态，统一在这里刷一次
         refreshTrustedUi()
     }
@@ -1065,6 +1115,7 @@ class SettingsActivity : AppCompatActivity() {
             .put("petCount", countSeek.progress + 1)
             .put("trustedOverlay", trustedSwitch.isChecked)
             .put("sayings", sayings)
+            .put("sayingsCombine", sayingsCombineSwitch.isChecked)
         if (!Store.writeUiSettings(this, obj.toString())) {
             Toast.makeText(this, "外观设置保存失败，请重试", Toast.LENGTH_SHORT).show()
             return
@@ -1270,13 +1321,32 @@ class SettingsActivity : AppCompatActivity() {
             setPadding(0, dp(16), 0, dp(8))
         })
 
-        // 通道 1：App 内下载安装（主推荐）
+        // 通道 1：App 内下载安装（主推荐 · 断点续传 + 已下载立即安装）
         var downloadStarted = false
-        val inAppBtn = updateModeCard("App 内下载安装", "推荐 · 留在应用内，下载后引导安装", true)
+        val inAppBtn = updateModeCard("", "", true)
         inAppBtn.layoutParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
         )
         card.addView(inAppBtn)
+
+        // 「重新下载」小链接：清除断点缓存从头下（仅当已有本地缓存时显示）
+        val resetLink = TextView(this).apply {
+            text = "重新下载（清除本地缓存）"
+            textSize = 11.5f
+            setTextColor(0xFF8A93A6.toInt())
+            gravity = Gravity.CENTER
+            setPadding(0, dp(6), 0, 0)
+            isVisible = false
+        }
+        card.addView(resetLink)
+
+        // 改 inAppBtn 内部标题/副标题（updateModeCard 层级：container[0]=textCol，textCol[0]=标题，textCol[1]=副标题）
+        fun setInAppLabel(title: String, sub: String) {
+            val container = inAppBtn as? LinearLayout ?: return
+            val textCol = container.getChildAt(0) as? LinearLayout ?: return
+            (textCol.getChildAt(0) as? TextView)?.text = title
+            (textCol.getChildAt(1) as? TextView)?.text = sub
+        }
 
         val progress = ProgressBar(this, null, 0, android.R.attr.progressBarStyleHorizontal).apply {
             max = 100
@@ -1324,42 +1394,99 @@ class SettingsActivity : AppCompatActivity() {
         dlgRef = dlg
         laterBtn.setOnClickListener { dlgRef?.dismiss() }
 
+        // 打开弹窗时：按本地缓存状态预置按钮文案（有完整包→"立即安装"，有断点→"继续下载"，都没有→"开始下载"）
+        val completedFile = if (apk != null) UpdateInstaller.findCompleted(this, apk) else null
+        val partial = if (apk != null) UpdateInstaller.findPartial(this, apk) else null
+        val hasLocalCache = completedFile != null || partial != null
+        resetLink.isVisible = hasLocalCache
+        if (apk == null) {
+            setInAppLabel("App 内下载安装", "该版本没有可直下的 APK，请用浏览器")
+            inAppBtn.isEnabled = false
+            inAppBtn.alpha = 0.55f
+        } else when {
+            completedFile != null -> {
+                setInAppLabel("已下载 · 立即安装", "${completedFile.length() / 1024 / 1024} MB · 点我直接装，不用重下")
+                if (partial != null) { /* 完整已就位，断点忽略 */ }
+            }
+            partial != null -> {
+                setInAppLabel("继续下载", "已下 ${partial.second / 1024} KB，断点续传")
+                progress.isVisible = true
+                progressLabel.isVisible = true
+                progressLabel.text = "已从断点恢复（已下 ${partial.second / 1024} KB）"
+            }
+            else -> setInAppLabel("App 内下载安装", "推荐 · 断点续传 · 下载后引导安装")
+        }
+
         inAppBtn.setOnClickListener {
-            if (downloadStarted) return@setOnClickListener
             if (apk == null) {
                 Toast.makeText(this, "该版本没有可直下的 APK，已改打开发布页", Toast.LENGTH_LONG).show()
                 openUrl(r.pageUrl)
                 return@setOnClickListener
             }
+            if (downloadStarted) return@setOnClickListener
             downloadStarted = true
             inAppBtn.isEnabled = false
             inAppBtn.alpha = 0.55f
             progress.isVisible = true
             progressLabel.isVisible = true
-            progressLabel.text = "正在下载… 0%"
-            UpdateInstaller.downloadAndInstall(
-                this, apk,
-                { percent, finished ->
-                    progress.progress = percent
-                    progressLabel.text =
-                        if (finished) "下载完成，正在打开安装器…" else "正在下载… $percent%"
-                },
-                { file ->
-                    if (file == null) {
+            // 完整包已就位 → 直接装（不重下）；否则走 downloadAndInstall（内部自动判断断点/重头）
+            val existing = UpdateInstaller.findCompleted(this, apk)
+            if (existing != null) {
+                progress.progress = 100
+                progressLabel.setTextColor(0xFF3B7A57.toInt())
+                progressLabel.text = "本地已有完整包，直接安装…"
+                main.post { UpdateInstaller.install(this, existing) }
+            } else {
+                progressLabel.setTextColor(0xFF3B6FD6.toInt())
+                progressLabel.text = "正在下载… 0%"
+                UpdateInstaller.downloadAndInstall(
+                    this, apk,
+                    { percent, finished ->
+                        progress.progress = percent
+                        progressLabel.text =
+                            if (finished) "下载完成，正在打开安装器…" else "正在下载… $percent%"
+                    },
+                    { file, msg ->
+                        if (msg != null) {
+                            // 出错：保留断点（.part 还在），按钮恢复，用户再点自动续传
+                            downloadStarted = false
+                            inAppBtn.isEnabled = true
+                            inAppBtn.alpha = 1f
+                            progress.isVisible = false
+                            progressLabel.isVisible = true
+                            progressLabel.setTextColor(0xFFC0392B.toInt())
+                            progressLabel.text = msg + " · 再点继续"
+                            // 断点还在 → 按钮变"继续下载"
+                            val p = UpdateInstaller.findPartial(this, apk)
+                            if (p != null) {
+                                setInAppLabel("继续下载", "已下 ${p.second / 1024} KB，断点续传")
+                            }
+                            return@downloadAndInstall
+                        }
+                        // 成功：file 在盘上
+                        progressLabel.isVisible = true
+                        progressLabel.setTextColor(0xFF3B7A57.toInt())
+                        progressLabel.text = "已下载，按系统提示安装即可（若被要求授权，回来点下方再装一次）"
+                        // 文件仍在盘 → 允许"授权回来后直接再装一次"
                         downloadStarted = false
                         inAppBtn.isEnabled = true
                         inAppBtn.alpha = 1f
-                        progress.isVisible = false
-                        progressLabel.isVisible = true
-                        progressLabel.setTextColor(0xFFC0392B.toInt())
-                        progressLabel.text = "下载失败，请改用「浏览器打开发布页」"
-                    } else {
-                        progressLabel.isVisible = true
-                        progressLabel.setTextColor(0xFF3B7A57.toInt())
-                        progressLabel.text = "已下载，按系统提示安装即可"
+                        setInAppLabel("已下载 · 立即安装", "授权后点我直接装，不用重下")
                     }
-                }
-            )
+                )
+            }
+        }
+
+        // 「重新下载」小链接：清缓存后强制从头下
+        resetLink.setOnClickListener {
+            if (apk == null) return@setOnClickListener
+            UpdateInstaller.clearCache(this, apk)
+            progress.isVisible = false
+            progressLabel.isVisible = false
+            setInAppLabel("App 内下载安装", "已清除本地缓存，将重新下载")
+            inAppBtn.isEnabled = true
+            inAppBtn.alpha = 1f
+            downloadStarted = false
         }
         browserBtn.setOnClickListener { openUrl(r.pageUrl) }
 

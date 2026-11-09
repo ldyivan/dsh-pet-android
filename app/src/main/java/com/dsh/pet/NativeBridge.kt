@@ -2,6 +2,8 @@ package com.dsh.pet
 
 import android.content.Context
 import android.webkit.JavascriptInterface
+import org.json.JSONArray
+import org.json.JSONObject
 
 /**
  * JS 侧 window.DshNative 的 Kotlin 实现。
@@ -36,9 +38,38 @@ class NativeBridge(private val svc: PetService) {
     /**
      * UI 偏好 JSON：{sizeRatio, opacity, clickSound, petCount, sayings[]}。
      * 渲染层（android/host.ts uiSettings()）负责夹取与兜底，这里只做透明存取。
+     *
+     * 台词库内置兜底（不重建 dsh-pet.js，纯在 Kotlin 读出口合并，host 自动消费）：
+     *  · 用户没填自定义（sayings 为空）        → 用 [defaultSayings] 默认库
+     *  · 用户填了自定义 + sayingsCombine=false → 仅用用户自定义库
+     *  · 用户填了自定义 + sayingsCombine=true  → 默认库 + 用户自定义（去重合并）
+     *  合并结果只作用于 sayings 字段，其它字段原样透传。
      */
     @JavascriptInterface
-    fun readUiSettings(): String = Store.readUiSettings(svc)
+    fun readUiSettings(): String {
+        val raw = Store.readUiSettings(svc)
+        return try {
+            val j = if (raw.isBlank()) JSONObject() else JSONObject(raw)
+            val custom = ArrayList<String>()
+            val arr = j.optJSONArray("sayings")
+            if (arr != null) {
+                for (i in 0 until arr.length()) {
+                    val s = arr.optString(i, "").trim()
+                    if (s.isNotEmpty()) custom.add(s)
+                }
+            }
+            val combine = j.optBoolean("sayingsCombine", false)
+            val merged = when {
+                custom.isEmpty() -> defaultSayings
+                combine -> (defaultSayings + custom).distinct()
+                else -> custom
+            }
+            j.put("sayings", JSONArray(merged))
+            j.toString()
+        } catch (e: Exception) {
+            raw
+        }
+    }
 
     @JavascriptInterface
     fun writeUiSettings(json: String): Boolean = Store.writeUiSettings(svc, json)
@@ -115,8 +146,30 @@ class NativeBridge(private val svc: PetService) {
      */
     @JavascriptInterface
     fun setClickThrough(on: Boolean) = svc.setClickThrough(on)
-
-    /** 吃白饭运行状态上报（JS 开演/收场边界调用）：通知栏按钮标签据此动态切换「吃白饭↔停止吃白饭」。 */
+/** 吃白饭运行状态上报（JS 开演/收场边界调用）：通知栏按钮标签据此动态切换「吃白饭↔停止吃白饭」。 */
     @JavascriptInterface
     fun setBaifanRunning(on: Boolean) = svc.setBaifanRunning(on)
+
+    companion object {
+        /**
+         * 内置默认台词库（桌面宠物口吻，轻松日常）。
+         * 用户没填自定义台词库时兜底用；开了「组合」开关时与自定义合并去重。
+         */
+        val defaultSayings: List<String> = listOf(
+            "主人，欢迎回来～",
+            "今天也要好好休息哦",
+            "需要我帮忙吗？",
+            "我在这儿呢，一直都在",
+            "有点想你了，才不是想偷懒",
+            "摸摸我的头嘛",
+            "窗外的云像在慢慢散步呢",
+            "别一直盯着屏幕啦，眨眨眼",
+            "我记得今天，你对我很好",
+            "要不要一起发会儿呆",
+            "我肚子咕噜了一声，大概没有",
+            "时间过得好快，你还好吗",
+            "悄悄说：你笑起来很好看",
+            "今天的我，也在努力营业中",
+        )
+    }
 }
