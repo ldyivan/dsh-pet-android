@@ -16,8 +16,8 @@ android {
         applicationId = "com.dsh.pet"
         minSdk = 26
         targetSdk = 35
-        versionCode = 35
-        versionName = "1.2.23"
+        versionCode = 54
+        versionName = "1.3.13"
     }
 
     buildTypes {

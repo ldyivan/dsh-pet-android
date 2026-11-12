@@ -33,6 +33,13 @@ import android.webkit.WebResourceRequest
 import android.webkit.WebResourceResponse
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import android.graphics.Color
+import android.graphics.Typeface
+import android.graphics.drawable.GradientDrawable
+import android.widget.FrameLayout
+import android.widget.LinearLayout
+import android.widget.TextView
+import androidx.core.content.ContextCompat
 import android.widget.RemoteViews
 import androidx.webkit.WebViewAssetLoader
 import org.json.JSONArray
@@ -147,6 +154,14 @@ class PetService : Service() {
     @Volatile
     private var captureConsume = false
 
+    /** 提醒气泡专用窗口（原生常驻，独立于 dsh-pet.js 的 8 窗口池与 WebView）：
+ *  FrameLayout 承载气泡卡；气泡可见时铺到屏幕固定位置，整卡可点跳设置页提醒 tab，
+ *  点关闭按钮收回 1×1。不依赖 WebView 的 alpha/触摸/定时器，灭屏·后台·pauseTimers 下照样常驻可见。 */
+    private var reminderView: FrameLayout? = null
+    private var reminderParams: WindowManager.LayoutParams? = null
+    /** 当前气泡卡内容（动态生成，整卡替换）；null = 无活跃气泡。 */
+    private var reminderCard: View? = null
+
     /** 穿透模式：true = 触摸层全部收回 1×1，屏幕整块穿透给下层 App（宠物仍渲染但不可交互）。 */
     @Volatile
     private var clickThrough = false
@@ -205,10 +220,19 @@ class PetService : Service() {
                 // 直接对 WebView 调，服务被杀时 WebView 为 null 自动跳过。
                 main.post {
                     when (a) {
-                        Intent.ACTION_SCREEN_OFF ->
+                        Intent.ACTION_SCREEN_OFF -> {
+                            // 灭屏：暂停吃白饭 + 冻结 WebView 定时器（省电）
                             webView?.evaluateJavascript("window.__dshBaifanPause && window.__dshBaifanPause()", null)
-                        Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT ->
+                            try { webView?.onPause() } catch (_: Exception) {}
+                            try { webView?.pauseTimers() } catch (_: Exception) {}
+                        }
+                        Intent.ACTION_SCREEN_ON, Intent.ACTION_USER_PRESENT -> {
+                            // 亮屏/解锁：恢复被灭屏冻结的 JS 渲染循环（移动/漫游等动作靠它）
+                            // 不 resume 桌宠动作会一直停住（v1.3.2 移动失效根因）
+                            try { webView?.resumeTimers() } catch (_: Exception) {}
+                            try { webView?.onResume() } catch (_: Exception) {}
                             webView?.evaluateJavascript("window.__dshBaifanResume && window.__dshBaifanResume()", null)
+                        }
                     }
                 }
             }
@@ -280,6 +304,10 @@ class PetService : Service() {
             ACTION_BAIFAN -> startBaifan()
             ACTION_BAIFAN_STOP -> stopBaifan()
             ACTION_CLICK_THROUGH -> toggleClickThrough()
+            ACTION_REMINDER_FIRE -> {
+                val ids = intent?.getStringArrayExtra(EXTRA_REMINDER_IDS)?.toList() ?: emptyList()
+                fireReminders(ids)
+            }
         }
         // 走到这里说明本次启动是「用户希望桌宠运行」的（启动按钮 / 通知栏动作 / 保活拉起）：
         // 落盘意图（进程被 ROM 杀掉后靠它决定该不该复活），并挂上 15 分钟看门狗。
@@ -344,6 +372,11 @@ class PetService : Service() {
         wv.webViewClient = object : WebViewClient() {
             override fun shouldInterceptRequest(view: WebView, request: WebResourceRequest): WebResourceResponse? =
                 assetLoader.shouldInterceptRequest(request.url)
+            override fun onPageFinished(view: WebView?, url: String?) {
+                // 页面加载完 = reminder.js 已挂 window.__dshReminderBubble；
+                // 补发到点时页面尚未就绪而被暂存的提醒气泡（v1.3.0 bug 修复）
+                main.post { onPageFinishedReminderFlush() }
+            }
         }
         wv.webChromeClient = object : WebChromeClient() {
             override fun onConsoleMessage(m: ConsoleMessage): Boolean {
@@ -395,6 +428,175 @@ class PetService : Service() {
     private fun createTouchWindow() {
         for (i in 0 until MAX_TOUCH_LAYERS) addTouchLayer()
         addCaptureLayer()
+        addReminderLayer()
+    }
+
+    /** 提醒气泡专用触摸窗口：初始 1×1 @(0,0) 不挡任何东西，气泡可见时由 applyReminderBubbleRect 铺开。 */
+    private fun addReminderLayer() {
+        val v = FrameLayout(this)
+        v.setBackgroundColor(0x00000000)
+        val p = WindowManager.LayoutParams(
+            1, 1,
+            overlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT,
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0; y = 0
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) setFitInsetsTypes(0)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P)
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+        try {
+            wm.addView(v, p)
+            reminderView = v
+            reminderParams = p
+        } catch (e: Exception) {
+            Log.w("dsh-pet", "添加提醒气泡窗口失败: ${e.message}")
+            reminderView = null
+            reminderParams = null
+        }
+    }
+
+    /** 生成一条原生常驻提醒气泡卡（白卡圆角 + 标题/正文/提示 + 右上「×」）。整卡可点跳提醒列表，点「×」关闭。 */
+    private fun buildReminderCard(id: String, title: String, text: String, isPlan: Boolean): View {
+        val d = resources.displayMetrics.density
+        fun dp(v: Int) = (v * d).toInt()
+        val card = FrameLayout(this)
+        val cardBg = GradientDrawable().apply {
+            setColor(ContextCompat.getColor(this@PetService, R.color.dsh_bg_card))
+            cornerRadius = 16f * d
+            setStroke(dp(1), ContextCompat.getColor(this@PetService, R.color.dsh_accent_stroke))
+        }
+        card.background = cardBg
+        card.elevation = dp(10).toFloat()
+
+        val content = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(14), dp(10), dp(14), dp(12))
+        }
+        content.addView(TextView(this).apply {
+            this.text = (if (isPlan) "计划 · " else "备忘 · ") + title
+            textSize = 14.5f
+            setTextColor(ContextCompat.getColor(this@PetService,
+                if (isPlan) R.color.dsh_accent else R.color.dsh_text_primary))
+            setTypeface(typeface, Typeface.BOLD)
+            maxLines = 2
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        })
+        if (text.isNotEmpty()) {
+            content.addView(TextView(this).apply {
+                this.text = text
+                textSize = 13f
+                setTextColor(ContextCompat.getColor(this@PetService, R.color.dsh_text_hint))
+                setPadding(0, dp(3), 0, 0)
+                maxLines = 3
+                ellipsize = android.text.TextUtils.TruncateAt.END
+            })
+        }
+        content.addView(TextView(this).apply {
+            this.text = if (isPlan) "点我看步骤并逐项勾选" else "点我查看提醒列表"
+            textSize = 11f
+            setTextColor(ContextCompat.getColor(this@PetService, R.color.dsh_text_faint))
+            setPadding(0, dp(5), 0, 0)
+        })
+        card.addView(content, FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
+
+        val close = TextView(this).apply {
+            this.text = "✕"
+            textSize = 15f
+            gravity = Gravity.CENTER
+            setTextColor(ContextCompat.getColor(this@PetService, R.color.dsh_text_hint))
+            background = GradientDrawable().apply {
+                setColor(ContextCompat.getColor(this@PetService, R.color.dsh_accent_soft))
+                cornerRadius = 99f * d
+            }
+            setOnClickListener { hideReminderBubble() }
+        }
+        card.addView(close, FrameLayout.LayoutParams(dp(24), dp(24)).apply {
+            gravity = Gravity.TOP or Gravity.END
+            topMargin = dp(4); marginEnd = dp(4)
+        })
+        // 整卡可点：跳设置页提醒 tab 并定位该条
+        card.setOnClickListener { openRemindersPage(id) }
+        card.layoutParams = FrameLayout.LayoutParams(
+            FrameLayout.LayoutParams.WRAP_CONTENT, FrameLayout.LayoutParams.WRAP_CONTENT)
+        return card
+    }
+
+    /** 弹原生常驻气泡：铺窗口到屏幕右上固定区，整卡可点，点「×」或跳列表后关闭。 */
+    private fun showNativeReminderBubble(id: String, title: String, text: String, isPlan: Boolean) {
+        val v = reminderView ?: return
+        val p = reminderParams ?: return
+        try {
+            val (sw, sh) = screenSize()
+            val d = resources.displayMetrics.density
+            val winW = (280 * d).toInt().coerceAtMost(sw)
+            p.width = winW
+            p.height = WindowManager.LayoutParams.WRAP_CONTENT
+            p.gravity = Gravity.TOP or Gravity.START
+            // 先落屏内安全位（宠物上方会在下一行 updateReminderBubblePosition 贴过去）
+            p.x = (sw - winW).coerceAtLeast(0)
+            p.y = 0
+            val card = buildReminderCard(id, title, text, isPlan)
+            reminderCard = card
+            v.removeAllViews()
+            v.addView(card, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
+            activeReminderId = id
+            try { wm.updateViewLayout(v, p) } catch (_: Exception) {}
+            updateReminderBubblePosition()
+            Log.i("dsh-pet", "原生常驻提醒气泡已显示(跟随宠物): $title")
+        } catch (e: Exception) {
+            Log.w("dsh-pet", "原生气泡显示失败（仍有通知兜底）: ${e.message}")
+        }
+    }
+    /** 让原生气泡跟随宠物本体（最大命中块 rectX/Y/W/H）：X 居中、Y 在宠物上方（越界则翻到下方）。
+     *  由 applyTouchLayerRects 每帧调用，宠物移动时气泡实时刷新位置。 */
+    private fun updateReminderBubblePosition() {
+        val v = reminderView ?: return
+        val p = reminderParams ?: return
+        if (activeReminderId == null) return
+        try {
+            val (sw, sh) = screenSize()
+            val d = resources.displayMetrics.density
+            val winW = (280 * d).toInt().coerceAtMost(sw)
+            p.width = winW
+            p.height = WindowManager.LayoutParams.WRAP_CONTENT
+            p.gravity = Gravity.TOP or Gravity.START
+            val gap = (10 * d).toInt()
+            val cardH = v.height.coerceAtLeast(0)
+            var bx = rectX + rectW / 2 - winW / 2
+            bx = bx.coerceIn(0, (sw - winW).coerceAtLeast(0))
+            var by = rectY - cardH - gap
+            if (by < 0) by = rectY + rectH + gap   // 上方放不下就翻到宠物下方
+            by = by.coerceIn(0, (sh - 1).coerceAtLeast(0))
+            if (p.x == bx && p.y == by) return
+            p.x = bx
+            p.y = by
+            wm.updateViewLayout(v, p)
+        } catch (_: Exception) {}
+    }
+
+    /** 关闭原生气泡：收回 1×1、清卡。 */
+    private fun hideReminderBubble() {
+        val v = reminderView ?: return
+        val p = reminderParams ?: return
+        try {
+            p.x = 0; p.y = 0; p.width = 1; p.height = 1
+            v.removeAllViews()
+            reminderCard = null
+            activeReminderId = null
+            try { wm.updateViewLayout(v, p) } catch (_: Exception) {}
+            Log.i("dsh-pet", "原生提醒气泡已关闭")
+        } catch (e: Exception) {
+            Log.w("dsh-pet", "关闭原生气泡失败: ${e.message}")
+        }
     }
 
     private fun addTouchLayer(): View {
@@ -716,6 +918,18 @@ class PetService : Service() {
         }
     }
 
+    /** 当前活跃提醒气泡的 id（点按跳提醒列表定位用）；null = 无活跃气泡。 */
+    @Volatile
+    private var activeReminderId: String? = null
+
+    /** 渲染页是否已加载完（reminder.js 已挂 window.__dshReminderBubble）。
+     *  未到点前 WebView 可能尚未就绪：到点触发时若未就绪，气泡先暂存 [pendingReminderBubbles]，
+     *  等 onPageFinished 再补发——否则 evaluateJavascript 调不到函数，气泡直接丢失（v1.3.0 bug）。 */
+    @Volatile
+    private var webViewPageReady = false
+    /** 待补发的提醒气泡（页面就绪后 flush）。每条 = (id, title, text, isPlan)。 */
+    private val pendingReminderBubbles = ArrayList<Array<String>>()
+
     /** 捕获层触摸分发：菜单外 DOWN → 注入合成 mousedown 让 JS 收起；菜单内 → 正常转发 */
     private fun onCaptureTouch(view: View, ev: MotionEvent): Boolean {
         if (!menuOpen) return false
@@ -853,6 +1067,8 @@ class PetService : Service() {
                     Log.w("dsh-pet", "touch updateViewLayout 失败: ${e.message}")
                 }
             }
+            // 原生气泡跟随宠物：每帧按最大命中块刷新位置（宠物移动时实时贴靠）
+            updateReminderBubblePosition()
             if (touchLogCount < 8) {
                 touchLogCount++
                 val desc = pxRects.joinToString(" ") { "${it[2]}x${it[3]}@(${it[0]},${it[1]})" }
@@ -960,6 +1176,132 @@ class PetService : Service() {
         val i = Intent(this, SettingsActivity::class.java)
             .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
         startActivity(i)
+    }
+
+    /** 带「定位到某条提醒」地打开设置页提醒 tab（气泡点击跳列表用）。 */
+    fun openRemindersPage(focusId: String? = null) {
+        val i = Intent(this, SettingsActivity::class.java)
+            .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+            .putExtra(SettingsActivity.EXTRA_REMINDER_TAB, true)
+        if (!focusId.isNullOrEmpty()) i.putExtra(SettingsActivity.EXTRA_FOCUS_REMINDER_ID, focusId)
+        startActivity(i)
+    }
+
+    /**
+     * 到点触发提醒：把 ids 中 pending 且已过点的项流转并落盘（memo→done / plan→triggered），
+     * 对**本次实际触发**的项逐条弹气泡（宠物旁），并给一条系统通知兜底（气泡被穿透/隐藏时仍能收到）。
+     * 气泡点按 → 跳提醒列表（带 focus id）。
+     */
+    fun fireReminders(ids: List<String>) {
+        if (ids.isEmpty()) return
+        // 到点常在锁屏/灭屏时触发（精确闹钟 RTC_WAKEUP），此时 WebView 可能正被
+        // pauseTimers 冻结（灭屏/隐藏时冻结 JS 定时器省电）。冻结态下 reminder.js 的
+        // rAF/定时上报会被卡住 → 气泡画了但不显示。发气泡前先恢复计时器，保证可见。
+        main.post {
+            try { webView?.resumeTimers() } catch (_: Exception) {}
+            try { webView?.onResume() } catch (_: Exception) {}
+        }
+        val fired = ReminderScheduler.fireDue(this, ids)
+        Log.i("dsh-pet", "提醒到点 fire: 请求 ${ids.size} 条，实际触发 ${fired.size} 条")
+        for (r in fired) {
+            val isPlan = r is Reminder.Plan
+            val text = if (isPlan) "计划「${r.title}」到了，逐项完成吧" else "备忘：${r.title}"
+            // 气泡（可点，点按跳列表并定位该条）——按该条 showBubble 开关生效
+            if (Reminder.showBubble(r)) {
+                main.post {
+                    showReminderBubble(r.id, r.title, text, isPlan)
+                }
+            }
+            // 系统通知兜底（气泡在穿透/隐藏态下不可见时仍可达）——按该条 showNotification 开关生效
+            if (Reminder.showNotification(r)) {
+                showReminderNotification(r.id, r.title, text)
+            }
+        }
+        // 触发后重挂其余待触发项（幂等）
+        main.postDelayed({ ReminderScheduler.armAll(this) }, 500L)
+    }
+
+    /** 弹一条常驻提醒气泡（原生独立窗口，不依赖 WebView 的 alpha/触摸/定时器）。
+     *  到点常在锁屏/灭屏时触发，WebView 可能被 pauseTimers 冻结、alpha 被压在阈值下，
+     *  DOM 气泡画了也看不见——改用原生小浮窗常驻，直到用户点「×」或点卡跳列表才关闭。 */
+    private fun showReminderBubble(id: String, title: String, text: String, isPlan: Boolean) {
+        showNativeReminderBubble(id, title, text, isPlan)
+    }
+    /** 旧的 JS 命中区上报路径（v1.3.2 起气泡改原生窗口，不再依赖 WebView DOM 命中区）。
+     *  保留方法仅为 NativeBridge.reminderBubbleRect 兼容；实际收放走 hideReminderBubble/showNativeReminderBubble。 */
+    fun applyReminderBubbleRect(json: String) {
+        // no-op：原生气泡窗口独立管理，无需 JS 上报矩形
+    }
+
+    /** 立即向（已就绪的）WebView 注入一条气泡。 */
+    private fun sendReminderBubbleNow(wv: WebView, id: String, title: String, text: String, isPlan: Boolean) {
+        val safeTitle = title.replace(Regex("[\"\\\\]"), " ").replace('\n', ' ')
+        val safeText = text.replace(Regex("[\"\\\\]"), " ").replace('\n', ' ')
+        val script = "(function(){try{" +
+            "if(window.__dshReminderBubble){window.__dshReminderBubble(" +
+            "JSON.stringify({id:" + JSONObject.quote(id) + ", title:" + JSONObject.quote(safeTitle) +
+            ", text:" + JSONObject.quote(safeText) + ", plan:" + isPlan + "});return;}" +
+            "}catch(e){}}" +
+            ")()"
+        try {
+            wv.evaluateJavascript(script, null)
+        } catch (e: Exception) {
+            Log.w("dsh-pet", "提醒气泡注入失败（降级为仅通知）: ${e.message}")
+        }
+    }
+
+    /** 页面加载完成：置就绪 + 补发暂存气泡。由 WebViewClient.onPageFinished 调。 */
+    fun onPageFinishedReminderFlush() {
+        webViewPageReady = true
+        val wv = webView ?: return
+        val flushed = synchronized(pendingReminderBubbles) {
+            val copy = pendingReminderBubbles.toList()
+            pendingReminderBubbles.clear()
+            copy
+        }
+        for (b in flushed) {
+            sendReminderBubbleNow(wv, b[0], b[1], b[2], b[3] == "1")
+        }
+        if (flushed.isNotEmpty()) Log.i("dsh-pet", "页面就绪，补发 ${flushed.size} 条暂存提醒气泡")
+    }
+
+    /** 系统通知兜底：提醒到点发一条（点通知跳提醒列表定位该条）。 */
+    private fun showReminderNotification(id: String, title: String, text: String) {
+        try {
+            val nm = getSystemService(Context.NOTIFICATION_SERVICE) as NotificationManager
+            ensureChannel(nm)
+            val i = Intent(this, SettingsActivity::class.java)
+                .addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
+                .putExtra(SettingsActivity.EXTRA_REMINDER_TAB, true)
+                .putExtra(SettingsActivity.EXTRA_FOCUS_REMINDER_ID, id)
+            val pi = PendingIntent.getActivity(
+                this, id.hashCode(), i,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            // 稍后提醒（Snooze）：广播 → ReminderAlarmReceiver 记一条 now+10min 的再次提醒
+            val snoozeIntent = Intent(this, ReminderAlarmReceiver::class.java).apply {
+                action = ReminderAlarmReceiver.ACTION_SNOOZE
+                putExtra(ReminderAlarmReceiver.EXTRA_ID, id)
+                putExtra(ReminderAlarmReceiver.EXTRA_SNOOZE_MIN, 10)
+            }
+            val snoozePi = PendingIntent.getBroadcast(
+                this, ("snooze_" + id).hashCode(), snoozeIntent,
+                PendingIntent.FLAG_UPDATE_CURRENT or PendingIntent.FLAG_IMMUTABLE,
+            )
+            // 免打扰时段：走静音渠道（不响铃不震动，仍留通知，起来后能看到）
+            val channel = if (inQuietHours()) CHANNEL_REMINDER_SILENT else CHANNEL_REMINDER
+            val b = Notification.Builder(this, channel)
+                .setSmallIcon(android.R.drawable.ic_popup_reminder)
+                .setContentTitle("$title")
+                .setContentText(text)
+                .setStyle(Notification.BigTextStyle().bigText(text))
+                .setContentIntent(pi)
+                .setAutoCancel(true)
+                .addAction(Notification.Action.Builder(null, "稍后 10 分钟", snoozePi).build())
+            nm.notify(0x60000000 + (id.hashCode() and 0x3fffffff), b.build())
+        } catch (e: Exception) {
+            Log.w("dsh-pet", "提醒通知发送失败: ${e.message}")
+        }
     }
 
     fun showPetNotification(title: String, text: String) {
@@ -1412,11 +1754,34 @@ class PetService : Service() {
     private fun ensureChannel(nm: NotificationManager) {
         if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.O) {
             if (nm.getNotificationChannel(CHANNEL_ID) == null) {
+                val ch = NotificationChannel(CHANNEL_ID, "桌宠", NotificationManager.IMPORTANCE_LOW)
+                nm.createNotificationChannel(ch)
+            }
+            // 提醒专用渠道：默认响铃 + 震动（用户可在系统里单独调），与桌宠常驻通知分开
+            if (nm.getNotificationChannel(CHANNEL_REMINDER) == null) {
+                val ch = NotificationChannel(
+                    CHANNEL_REMINDER, "提醒", NotificationManager.IMPORTANCE_HIGH)
+                ch.enableVibration(true)
+                ch.vibrationPattern = longArrayOf(0, 200, 120, 200)
+                ch.enableLights(true)
+                nm.createNotificationChannel(ch)
+            }
+            if (nm.getNotificationChannel(CHANNEL_REMINDER_SILENT) == null) {
                 nm.createNotificationChannel(
-                    NotificationChannel(CHANNEL_ID, "桌宠", NotificationManager.IMPORTANCE_LOW)
-                )
+                    NotificationChannel(CHANNEL_REMINDER_SILENT, "提醒（静音）",
+                        NotificationManager.IMPORTANCE_LOW))
             }
         }
+    }
+
+    /** 当前是否处于免打扰时段（设置页可配，默认 23:00–07:00 关闭）。 */
+    private fun inQuietHours(): Boolean {
+        val enabled = Store.prefBool(this, "quietEnabled", true)
+        if (!enabled) return false
+        val start = Store.prefInt(this, "quietStart", 23)
+        val end = Store.prefInt(this, "quietEnd", 7)
+        val h = java.time.LocalTime.now().hour
+        return if (start <= end) h in start until end else (h >= start || h < end)
     }
 
     private fun nextNotifyId(): Int = (System.currentTimeMillis() % 100000).toInt()
@@ -1472,6 +1837,10 @@ class PetService : Service() {
 
     companion object {
         const val CHANNEL_ID = "dsh-pet-main"
+        /** 提醒专用通知渠道（响铃 + 震动）。 */
+        const val CHANNEL_REMINDER = "dsh-pet-reminder"
+        /** 免打扰时段的静音提醒渠道（不出声不震动）。 */
+        const val CHANNEL_REMINDER_SILENT = "dsh-pet-reminder-silent"
         const val FOREGROUND_ID = 7340
 
         /**
@@ -1503,6 +1872,9 @@ class PetService : Service() {
         const val ACTION_BAIFAN_STOP = "com.dsh.pet.action.BAIFAN_STOP"
         /** 通知栏动作：穿透/停止穿透 toggle */
         const val ACTION_CLICK_THROUGH = "com.dsh.pet.action.CLICK_THROUGH"
+        /** 提醒/计划到点：携带 [EXTRA_REMINDER_IDS]，拉起服务后 fire（弹气泡 + 改状态） */
+        const val ACTION_REMINDER_FIRE = "com.dsh.pet.action.REMINDER_FIRE"
+        const val EXTRA_REMINDER_IDS = "com.dsh.pet.extra.REMINDER_IDS"
         const val EXTRA_PET_SIZE_RATIO = "com.dsh.pet.extra.PET_SIZE_RATIO"
 
         /** 运行态单例引用（设置页保存后据此触发 reloadConfig） */

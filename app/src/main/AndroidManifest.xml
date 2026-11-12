@@ -21,6 +21,9 @@
     <uses-permission android:name="android.permission.WAKE_LOCK" />
     <!-- App 内下载安装：允许本应用请求安装 APK（部分 ROM 还需在系统里开「允许安装未知应用」） -->
     <uses-permission android:name="android.permission.REQUEST_INSTALL_PACKAGES" />
+    <!-- 提醒/计划：精确闹钟（USE_EXACT_ALARM 在 33+ 免用户授权；SCHEDULE_EXACT_ALARM 覆盖 26-32） -->
+    <uses-permission android:name="android.permission.SCHEDULE_EXACT_ALARM" />
+    <uses-permission android:name="android.permission.USE_EXACT_ALARM" />
     <application
         android:name=".DshApp"
         android:allowBackup="true"
@@ -68,6 +71,27 @@
             </intent-filter>
         </receiver>
 
+        <!-- 提醒/计划：精确闹钟到点被叫醒 → 转手拉起 PetService fire（弹气泡 + 改状态） -->
+        <receiver
+            android:name=".ReminderAlarmReceiver"
+            android:exported="false">
+            <intent-filter>
+                <action android:name="com.dsh.pet.action.REMINDER_ALARM" />
+                <action android:name="com.dsh.pet.action.REMINDER_SNOOZE" />
+            </intent-filter>
+        </receiver>
+
+        <!-- 桌面小组件：提醒速览（显示最近 4 条待办，点击直达提醒页） -->
+        <receiver
+            android:name=".ReminderWidgetProvider"
+            android:exported="true">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/widget_reminders_info" />
+        </receiver>
         <!-- 完全体模式：无障碍覆盖层窗口（系统 trusted overlay，不受遮挡判定约束） -->
         <service
             android:name=".PetA11yService"

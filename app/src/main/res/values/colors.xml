@@ -1,0 +1,46 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- 页面背景 -->
+    <color name="dsh_bg">#FFF3F5FB</color>
+    <color name="dsh_bg_card">#FFFFFFFF</color>
+    <color name="dsh_window_bg">#FFF7F9FF</color>
+    <!-- 主文字 / 次文字 -->
+    <color name="dsh_text_primary">#FF141A2B</color>
+    <color name="dsh_text_secondary">#FF2A3244</color>
+    <color name="dsh_text_hint">#FF7A839A</color>
+    <color name="dsh_text_faint">#FF9AA3B5</color>
+    <color name="dsh_text_input">#FF1F2637</color>
+    <color name="dsh_text_input_hint">#FFAEB6C6</color>
+    <!-- 品牌蓝 / 选中 -->
+    <color name="dsh_accent">#FF3B6FD6</color>
+    <color name="dsh_accent_fg">#FFFFFFFF</color>
+    <color name="dsh_accent_soft">#FFEDF1F9</color>
+    <color name="dsh_accent_stroke">#FFDCE2EF</color>
+    <color name="dsh_focus_highlight">#FFE3ECFF</color>
+    <color name="dsh_section_title">#FF5B6B8C</color>
+    <!-- 状态色 -->
+    <color name="dsh_success">#FF2E7D4F</color>
+    <color name="dsh_success_bg">#FFE8F7EE</color>
+    <color name="dsh_warning">#FFB26A00</color>
+    <color name="dsh_warning_bg">#FFFDF3E0</color>
+    <color name="dsh_danger">#FFC53030</color>
+    <color name="dsh_danger_bg">#FFFCECEC</color>
+    <!-- 轮子 / 控件 -->
+    <color name="dsh_wheel_bg">#FFEDF1F9</color>
+    <color name="dsh_input_bg">#FFF7F9FD</color>
+    <color name="dsh_dot_inactive">#FFB9C0D0</color>
+    <color name="dsh_status_bar">#FF7FA8FF</color>
+    <!-- 状态指示（运行中 / 停止 / 隐藏 / 无权限 / 分隔线 / 禁用） -->
+    <color name="dsh_status_run">#FF34C759</color>
+    <color name="dsh_status_stop">#FFE05A5A</color>
+    <color name="dsh_status_hidden">#FFF0B429</color>
+    <color name="dsh_status_disabled">#FFE4E8F1</color>
+    <color name="dsh_divider">#FFE8ECF4</color>
+    <color name="dsh_perm_deny_bg">#FFFDECEC</color>
+    <color name="dsh_perm_grant_stroke">#FF9BD9B4</color>
+    <color name="dsh_perm_deny_stroke">#FFF3B4B4</color>
+    <!-- 底部悬浮提示条（撤销等） -->
+    <color name="dsh_snack_bg">#FF1F2637</color>
+    <color name="dsh_snack_fg">#FFFFFFFF</color>
+    <color name="dsh_snack_action">#FF8FE6AE</color>
+</resources>

@@ -1,6 +1,7 @@
 package com.dsh.pet
 
 import android.content.Context
+import org.json.JSONObject
 import java.io.File
 
 /**
@@ -35,6 +36,46 @@ object Store {
      */
     fun readUiSettings(ctx: Context): String = readText(f(ctx, "ui-settings.json")).ifEmpty { "{}" }
     fun writeUiSettings(ctx: Context, json: String): Boolean = writeAtomic(f(ctx, "ui-settings.json"), json)
+/** 提醒/计划（备忘 + 多步骤计划）：reminders.json，独立于 UI 偏好，坏了不影响外观设置。 */
+    fun readReminders(ctx: Context): String = readText(f(ctx, "reminders.json")).ifEmpty { "" }
+    fun writeReminders(ctx: Context, json: String): Boolean = writeAtomic(f(ctx, "reminders.json"), json)
+
+    /** 读一个布尔偏好（存 ui-settings.json 里的 flags 对象，不额外建文件）。 */
+    fun prefBool(ctx: Context, key: String, def: Boolean): Boolean = try {
+        val o = JSONObject(readUiSettings(ctx))
+        val flags = o.optJSONObject("flags") ?: return def
+        flags.optBoolean(key, def)
+    } catch (e: Exception) { def }
+
+    /** 写一个布尔偏好（合入 ui-settings.json 的 flags，保留其它字段）。 */
+    fun prefSet(ctx: Context, key: String, value: Boolean) {
+        try {
+            val o = try { JSONObject(readUiSettings(ctx)) } catch (e: Exception) { JSONObject() }
+            val flags = o.optJSONObject("flags") ?: JSONObject()
+            flags.put(key, value)
+            o.put("flags", flags)
+            writeUiSettings(ctx, o.toString())
+        } catch (_: Exception) { }
+    }
+
+    /** 读整型偏好（同样的 flags 存储）。 */
+    fun prefInt(ctx: Context, key: String, def: Int): Int = try {
+        val o = JSONObject(readUiSettings(ctx))
+        val flags = o.optJSONObject("flags") ?: return def
+        flags.optInt(key, def)
+    } catch (e: Exception) { def }
+
+    /** 写整型偏好。 */
+    fun prefSetInt(ctx: Context, key: String, value: Int) {
+        try {
+            val o = try { JSONObject(readUiSettings(ctx)) } catch (e: Exception) { JSONObject() }
+            val flags = o.optJSONObject("flags") ?: JSONObject()
+            flags.put(key, value)
+            o.put("flags", flags)
+            writeUiSettings(ctx, o.toString())
+        } catch (_: Exception) { }
+    }
+
 
     private fun readText(f: File): String = try {
         if (f.exists() && f.isFile) f.readText(Charsets.UTF_8) else ""

@@ -150,6 +150,21 @@ class NativeBridge(private val svc: PetService) {
     @JavascriptInterface
     fun setBaifanRunning(on: Boolean) = svc.setBaifanRunning(on)
 
+    /**
+     * 提醒气泡点击 → 跳设置页提醒 tab 并定位到该条（focusId 可为空 = 只进提醒 tab）。
+     * 由 reminder.js 的 __dshReminderBubble 气泡点击调用。
+     */
+    @JavascriptInterface
+    fun openReminders(focusId: String?) = svc.openRemindersPage(focusId)
+
+    /**
+     * 提醒气泡命中区上报（JS 归一化矩形）：Kotlin 铺一个**专用**触摸层窗口（不复用 dsh-pet.js
+     * 的 8 窗口池，避免被其每帧心跳 applyTouchLayersJson 盖掉），点按跳设置页提醒 tab 定位该条。
+     * json = {x,y,w,h,id} 或 {active:false}（收回）。
+     */
+    @JavascriptInterface
+    fun reminderBubbleRect(json: String) = svc.applyReminderBubbleRect(json)
+
     companion object {
         /**
          * 内置默认台词库（桌面宠物口吻，轻松日常）。

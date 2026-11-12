@@ -26,6 +26,20 @@ import android.widget.SeekBar
 import android.widget.Switch
 import android.widget.TextView
 import android.widget.Toast
+import android.widget.FrameLayout
+import android.app.DatePickerDialog
+import android.app.TimePickerDialog
+import android.widget.CheckBox
+import android.view.MotionEvent
+import android.graphics.Canvas
+import android.graphics.Paint
+import android.widget.NumberPicker
+import java.text.SimpleDateFormat
+import java.util.Locale
+import java.time.LocalDate
+import java.time.LocalTime
+import java.time.ZoneId
+import java.time.ZonedDateTime
 import androidx.appcompat.app.AlertDialog
 import androidx.appcompat.app.AppCompatActivity
 import androidx.core.app.ActivityCompat
@@ -62,6 +76,13 @@ import java.io.File
  */
 class SettingsActivity : AppCompatActivity() {
 
+    companion object {
+        /** 启动时携带「进提醒 tab」标记（提醒气泡/通知点击跳列表用） */
+        const val EXTRA_REMINDER_TAB = "com.dsh.pet.extra.REMINDER_TAB"
+        /** 定位到某条提醒（滚动 + 高亮）；为空则定位到列表头 */
+        const val EXTRA_FOCUS_REMINDER_ID = "com.dsh.pet.extra.FOCUS_REMINDER_ID"
+    }
+
     private lateinit var statusText: TextView
     private lateinit var statusDot: View
     private lateinit var powerBtn: Button
@@ -76,6 +97,60 @@ class SettingsActivity : AppCompatActivity() {
     private lateinit var hideTaskSwitch: Switch
     /** 「台词库含内置默认」组合开关：勾选 = 自定义 + 默认库组合；不勾选 = 仅自定义（留空仍自动用默认库） */
     private lateinit var sayingsCombineSwitch: Switch
+    // ---- 提醒 tab（备忘 / 计划）----
+    private lateinit var settingsTabScroll: ScrollView
+    private lateinit var contentFrame: FrameLayout
+    private lateinit var reminderTabRoot: LinearLayout
+    private lateinit var reminderTabScroll: ScrollView
+    private lateinit var reminderListContainer: LinearLayout
+    private lateinit var reminderEmpty: TextView
+    /** 首次操作提示条（左滑/长按提示，用过后自动隐藏）。 */
+    private var reminderHintBar: TextView? = null
+    /** 免打扰时段摘要文本（滚轮弹窗保存后回写，避免整页重载）。 */
+    private var quietSummaryView: TextView? = null
+    /** 底部悬浮提示层（删除撤销条等），叠在内容区之上、tab 栏之上不遮挡 tab。 */
+    private var snackOverlay: android.widget.FrameLayout? = null
+    /** 当前显示的撤销条（新的覆盖旧的，避免叠加）。 */
+    private var snackBar: View? = null
+
+    /** 空状态宿主（插画 + 文案），整体显隐。 */
+    private var reminderEmptyHost: LinearLayout? = null
+    /** 已完成项分组是否展开（默认折叠）。 */
+    private var doneGroupExpanded = false
+    /** 搜索关键词（标题/步骤/标签模糊匹配）。 */
+    private var reminderQuery = ""
+    /** 排序：time_asc / time_desc / title */
+    private var reminderSort = "time_asc"
+    /** 删除撤销缓存：最近一次删除的整表快照（用于撤销）。 */
+    private var undoSnapshot: String? = null
+    private var undoTimer: Runnable? = null
+    private lateinit var tabReminderBtn: Button
+    private lateinit var tabSettingsBtn: Button
+    private var activeTabIsReminder = false
+    private var reminderFocusId: String? = null
+    // 提醒倒计时：当前列表每项 (标签, 目标时间ms)，cdTick 每秒刷新文案（<12h 精确到秒）
+    private val countdownLabels = ArrayList<TextView>()
+    private val countdownTargets = ArrayList<Long>()
+    private val cdTick = object : Runnable {
+        private var tickCount = 0L
+        override fun run() {
+            if (countdownLabels.isEmpty()) return
+            tickCount++
+            val nowMs = System.currentTimeMillis()
+            for (i in countdownLabels.indices) {
+                val cd = countdownLabels[i]
+                val target = countdownTargets[i]
+                val left = target - nowMs
+                // 节流：只有 <12h 的项需要秒级刷新；≥12h 的文案一分钟才变一次，30 秒刷一次即可（省 CPU）
+                if (left >= 12L * 3600 * 1000 && tickCount % 30L != 1L) continue
+                cd.text = countdownText(target, nowMs)
+                // 不足 1 小时变强调色，提醒感更强
+                cd.setTextColor(if (left < 3600000L)
+                    colorRes(R.color.dsh_accent) else colorRes(R.color.dsh_text_hint))
+            }
+            main.postDelayed(this, 1000L)
+        }
+    }
 
     private lateinit var sizeSeek: SeekBar
     private lateinit var sizeVal: TextView
@@ -109,6 +184,13 @@ class SettingsActivity : AppCompatActivity() {
     private val main = Handler(Looper.getMainLooper())
     private val REQ_NOTIFY = 1001
     private val REQ_OVERLAY = 1002
+    private val REQ_EXPORT_REMINDERS = 1003
+    private val REQ_IMPORT_REMINDERS = 1004
+    /** 导出文本类文件（Markdown / ics）：内容先存字段，选完文件后写入。 */
+    private val REQ_EXPORT_TEXT = 1005
+    private var pendingExportText: String = ""
+    /** 一次性提示条的偏好键（存 ui-settings.json 的 flags）。 */
+    private val KEY_REMINDER_HINT_SHOWN = "reminderHintShown"
 
     /** 加载配置期间不要触发「改动即保存」 */
     private var loading = true
@@ -178,6 +260,17 @@ class SettingsActivity : AppCompatActivity() {
         }
     }
 
+    /** 已在运行（后台）时被气泡/通知/小组件再次拉起：切到提醒 tab，而不是仍停在设置页。 */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        if (intent.getBooleanExtra(EXTRA_REMINDER_TAB, false)) {
+            reminderFocusId = intent.getStringExtra(EXTRA_FOCUS_REMINDER_ID)
+            switchTab(true)
+            refreshReminderList()
+        }
+    }
+
     override fun onResume() {
         super.onResume()
         refreshPermState()
@@ -209,13 +302,17 @@ class SettingsActivity : AppCompatActivity() {
 
     // ------------------------------------------------------------------ UI
 
+    /** 运行时取色：随系统浅色/深色自动选 values/ 或 values-night/ 色板（暗黑适配）。 */
+    private fun colorRes(id: Int): Int =
+        androidx.core.content.ContextCompat.getColor(this, id)
+
     private val dp = { v: Int -> (v * resources.displayMetrics.density).toInt() }
 
     private fun buildUi(): ViewGroup {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(28), dp(16), dp(32))
-            setBackgroundColor(0xFFF3F5FB.toInt())
+            setBackgroundColor(colorRes(R.color.dsh_bg))
         }
 
         // ---------------- 头部 ----------------
@@ -223,12 +320,12 @@ class SettingsActivity : AppCompatActivity() {
             text = getString(R.string.settings_title)
             textSize = 26f
             setTypeface(typeface, android.graphics.Typeface.BOLD)
-            setTextColor(0xFF141A2B.toInt())
+            setTextColor(colorRes(R.color.dsh_text_primary))
         })
         root.addView(TextView(this).apply {
             text = "蓝色大肥鱼 · 桌面宠物"
             textSize = 13f
-            setTextColor(0xFF7A839A.toInt())
+            setTextColor(colorRes(R.color.dsh_text_hint))
             setPadding(0, dp(4), 0, dp(2))
         })
 
@@ -239,12 +336,12 @@ class SettingsActivity : AppCompatActivity() {
                 gravity = Gravity.CENTER_VERTICAL
             }
             statusDot = View(this@SettingsActivity).apply {
-                background = roundRect(0xFFB9C0D0.toInt(), 99, 0)
+                background = roundRect(colorRes(R.color.dsh_dot_inactive), 99, 0)
             }
             row.addView(statusDot, LinearLayout.LayoutParams(dp(9), dp(9)).apply { rightMargin = dp(8) })
             statusText = TextView(this@SettingsActivity).apply {
                 textSize = 14f
-                setTextColor(0xFF2A3244.toInt())
+                setTextColor(colorRes(R.color.dsh_text_secondary))
             }
             row.addView(statusText, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
             addView(row)
@@ -307,7 +404,7 @@ class SettingsActivity : AppCompatActivity() {
             hideTaskSwitch = Switch(this@SettingsActivity).apply {
                 text = "从最近任务隐藏（防误删后台）"
                 textSize = 14f
-                setTextColor(0xFF2A3244.toInt())
+                setTextColor(colorRes(R.color.dsh_text_secondary))
                 setPadding(0, dp(8), 0, dp(2))
                 isChecked = KeepAlive.isHiddenFromRecents(this@SettingsActivity)
                 setOnCheckedChangeListener { _, checked ->
@@ -353,7 +450,7 @@ class SettingsActivity : AppCompatActivity() {
             trustedSwitch = Switch(this@SettingsActivity).apply {
                 text = "完全体模式（透明度可到 100%）"
                 textSize = 14f
-                setTextColor(0xFF2A3244.toInt())
+                setTextColor(colorRes(R.color.dsh_text_secondary))
                 setPadding(0, dp(10), 0, dp(2))
                 setOnCheckedChangeListener { _, checked -> if (!loading) onTrustedChanged(checked) }
             }
@@ -373,7 +470,7 @@ class SettingsActivity : AppCompatActivity() {
             soundSwitch = Switch(this@SettingsActivity).apply {
                 text = "点击音效"
                 textSize = 14f
-                setTextColor(0xFF2A3244.toInt())
+                setTextColor(colorRes(R.color.dsh_text_secondary))
                 setPadding(0, dp(4), 0, dp(4))
                 setOnCheckedChangeListener { _, _ -> if (!loading) onUiChanged() }
             }
@@ -382,18 +479,18 @@ class SettingsActivity : AppCompatActivity() {
             addView(TextView(this@SettingsActivity).apply {
                 text = "点击台词库（每行一句）"
                 textSize = 12.5f
-                setTextColor(0xFF7A839A.toInt())
+                setTextColor(colorRes(R.color.dsh_text_hint))
                 setPadding(0, dp(10), 0, dp(6))
             })
             sayingsEdit = EditText(this@SettingsActivity).apply {
                 hint = "留空则用内置默认台词库"
-                setHintTextColor(0xFFAEB6C6.toInt())
-                setTextColor(0xFF1F2637.toInt())
+                setHintTextColor(colorRes(R.color.dsh_text_input_hint))
+                setTextColor(colorRes(R.color.dsh_text_input))
                 textSize = 14f
                 gravity = Gravity.TOP
                 minLines = 3
                 maxLines = 8
-                background = roundRect(0xFFFFFFFF.toInt(), 14, 0xFFDCE2EF.toInt())
+                background = roundRect(colorRes(R.color.dsh_bg_card), 14, colorRes(R.color.dsh_accent_stroke))
                 setPadding(dp(12), dp(10), dp(12), dp(10))
                 addTextChangedListener(object : TextWatcher {
                     override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
@@ -411,7 +508,7 @@ class SettingsActivity : AppCompatActivity() {
             sayingsCombineSwitch = Switch(this@SettingsActivity).apply {
                 text = "台词库含内置默认"
                 textSize = 14f
-                setTextColor(0xFF2A3244.toInt())
+                setTextColor(colorRes(R.color.dsh_text_secondary))
                 setPadding(0, dp(8), 0, dp(2))
                 isChecked = try {
                     JSONObject(Store.readUiSettings(this@SettingsActivity)).optBoolean("sayingsCombine", false)
@@ -428,11 +525,41 @@ class SettingsActivity : AppCompatActivity() {
 
         // ---------------- AI ----------------
         root.addView(card {
+            addView(sectionTitle("提醒通知"))
+            addView(desc("到点提醒的响铃方式；免打扰时段内改为静默通知（只在通知栏留记录，不响不震）。"))
+            val quietSw = Switch(this@SettingsActivity).apply {
+                text = "启用免打扰时段"
+                textSize = 14f
+                setTextColor(colorRes(R.color.dsh_text_primary))
+            }
+            val rangeText = TextView(this@SettingsActivity).apply {
+                text = quietRangeText()
+                textSize = 13f
+                setTextColor(colorRes(R.color.dsh_text_secondary))
+                setPadding(0, dp(6), 0, 0)
+            }
+            val pickRow = LinearLayout(this@SettingsActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, dp(10), 0, 0)
+            }
+            val pickBtn = pill("设置时段", false) { showQuietHoursDialog() }
+            pickRow.addView(pickBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            quietSummaryView = rangeText
+            addView(quietSw)
+            addView(rangeText)
+            addView(pickRow)
+            // 开关只负责保存；时段数值统一在滚轮弹窗里改（此前「开启时顺带弹结束时间」很绕，已移除）
+            quietSw.isChecked = Store.prefBool(this@SettingsActivity, "quietEnabled", true)
+            quietSw.setOnCheckedChangeListener { _, checked ->
+                Store.prefSet(this@SettingsActivity, "quietEnabled", checked)
+            }
+        })
+        root.addView(card {
             addView(sectionTitle("AI 对话"))
             aiEnabled = Switch(this@SettingsActivity).apply {
                 text = getString(R.string.settings_ai_enabled)
                 textSize = 14f
-                setTextColor(0xFF2A3244.toInt())
+                setTextColor(colorRes(R.color.dsh_text_secondary))
                 setPadding(0, dp(4), 0, dp(6))
                 setOnCheckedChangeListener { _, _ -> if (!loading) saveAiSettings(false) }
             }
@@ -452,7 +579,7 @@ class SettingsActivity : AppCompatActivity() {
             aiHint = TextView(this@SettingsActivity).apply {
                 text = ""
                 textSize = 12f
-                setTextColor(0xFF3B7A57.toInt())
+                setTextColor(colorRes(R.color.dsh_success))
                 setPadding(0, dp(8), 0, 0)
             }
             addView(aiHint)
@@ -485,7 +612,7 @@ class SettingsActivity : AppCompatActivity() {
             updateHint = TextView(this@SettingsActivity).apply {
                 text = "检查 GitHub 上是否有新版本。"
                 textSize = 12.5f
-                setTextColor(0xFF7A839A.toInt())
+                setTextColor(colorRes(R.color.dsh_text_hint))
                 setPadding(0, dp(8), 0, dp(4))
             }
             addView(updateHint)
@@ -499,23 +626,1717 @@ class SettingsActivity : AppCompatActivity() {
                 ).apply { topMargin = dp(8) },
             )
         })
-        return ScrollView(this).apply {
+        // ---------------- 提醒 tab（与设置同栏，放内容区上方标题栏下方最底部） ----------------
+        reminderTabRoot = buildReminderTab()
+
+        // 内容区：两个 ScrollView（设置 / 提醒）叠在 FrameLayout 里，切 tab 只切可见性
+        settingsTabScroll = ScrollView(this).apply {
             addView(root, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
-            setBackgroundColor(0xFFF3F5FB.toInt())
-            isFillViewport = true
+            setBackgroundColor(colorRes(R.color.dsh_bg))
+            isVerticalScrollBarEnabled = false
+        }
+        reminderTabScroll = ScrollView(this).apply {
+            addView(reminderTabRoot, ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT)
+            setBackgroundColor(colorRes(R.color.dsh_bg))
+            isVerticalScrollBarEnabled = false
+        }
+        contentFrame = FrameLayout(this).apply {
+            addView(settingsTabScroll, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+            ))
+            addView(reminderTabScroll, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+            ))
+        }
+        reminderTabScroll.visibility = View.GONE
+
+        // 外层：内容区占满 + 底部固定 tab 栏（需求：提醒 与 设置 放在同一栏）
+        // 内容区外套 FrameLayout：底部悬浮提示（撤销条）叠在其上，不挤占列表布局
+        val contentHost = FrameLayout(this).apply {
+            addView(contentFrame, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+            ))
+            snackOverlay = FrameLayout(this@SettingsActivity)
+            addView(snackOverlay, FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT,
+            ))
+        }
+        val outer = LinearLayout(this).apply {
+            orientation = LinearLayout.VERTICAL
+            setBackgroundColor(colorRes(R.color.dsh_bg))
+            addView(contentHost, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f,
+            ))
+            addView(buildTabBar(), LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            ))
+        }
+
+        // 从通知/气泡跳来：带定位 id 则默认进提醒 tab
+        reminderFocusId = intent?.getStringExtra(EXTRA_FOCUS_REMINDER_ID)
+        if (intent?.getBooleanExtra(EXTRA_REMINDER_TAB, false) == true) {
+            switchTab(true)
+            refreshReminderList()
+            if (!reminderFocusId.isNullOrEmpty()) {
+                // 先取局部 val 捕获非空值：lambda 300ms 后执行时 reminderFocusId 已被置 null，
+                // 直接读字段会 NPE（崩溃 580 行根因）；if 内已确认非空，!! 安全
+                val focusId = reminderFocusId!!
+                main.postDelayed({ focusReminderItem(focusId) }, 300L)
+                reminderFocusId = null
+            }
+        } else {
+            refreshReminderList()
+        }
+        return outer
+    }
+
+    /** 底部 tab 栏：提醒 | 设置（与设置页卡片同风格——pill 按钮，选中蓝、未选灰） */
+    private fun buildTabBar(): View {
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(10), dp(16), dp(12))
+            setBackgroundColor(colorRes(R.color.dsh_bg_card))
+            elevation = dp(6).toFloat()
+        }
+        tabReminderBtn = tabBarPill("提醒") { switchTab(true) }
+        tabSettingsBtn = tabBarPill("设置") { switchTab(false) }
+        bar.addView(tabReminderBtn, LinearLayout.LayoutParams(0, dp(44), 1f))
+        bar.addView(
+            View(this).apply {
+                layoutParams = LinearLayout.LayoutParams(dp(8), 0)
+            }
+        )
+        bar.addView(tabSettingsBtn, LinearLayout.LayoutParams(0, dp(44), 1f))
+        paintTabBar()
+        return bar
+    }
+
+    /** tab 按钮：胶囊，选中=蓝底白字，未选=浅灰底深灰字（与 pill 视觉一致） */
+    private fun tabBarPill(text: String, onClick: () -> Unit) = Button(this).apply {
+        this.text = text
+        textSize = 14f
+        isAllCaps = false
+        gravity = Gravity.CENTER
+        includeFontPadding = false
+        stateListAnimator = null
+        minHeight = 0
+        minimumHeight = 0
+        minWidth = 0
+        minimumWidth = 0
+        setPadding(dp(14), 0, dp(14), 0)
+        setOnClickListener { onClick() }
+    }
+
+    /** 切 tab：改可见性 + 刷 tab 栏选中态。toReminder=true 进提醒页。 */
+    private fun switchTab(toReminder: Boolean) {
+        if (activeTabIsReminder == toReminder) return
+        activeTabIsReminder = toReminder
+        // contentFrame[0]=设置 scroll，[1]=提醒 scroll，切 tab 只翻可见性
+        contentFrame.getChildAt(0)?.visibility = if (toReminder) View.GONE else View.VISIBLE
+        contentFrame.getChildAt(1)?.visibility = if (toReminder) View.VISIBLE else View.GONE
+        if (toReminder) refreshReminderList()
+        paintTabBar()
+    }
+
+    private fun paintTabBar() {
+        fun paint(b: Button, active: Boolean) {
+            b.setTextColor(if (active) Color.WHITE else colorRes(R.color.dsh_section_title))
+            b.background = roundRect(
+                if (active) colorRes(R.color.dsh_accent) else colorRes(R.color.dsh_accent_soft),
+                14, 0,
+            )
+        }
+        paint(tabReminderBtn, activeTabIsReminder)
+        paint(tabSettingsBtn, !activeTabIsReminder)
+    }
+
+    // ============================================================ 提醒 tab（备忘 / 计划）
+
+    /** 提醒 tab 内容：头部（标题 + 新增按钮）+ 空态 + 列表容器。 */
+    private fun buildReminderTab(): LinearLayout {
+        val ctx = this@SettingsActivity
+        val root = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(16), dp(24), dp(16), dp(32))
+        }
+        // 头部两行：标题独占一行（不再和三个按钮挤在一起），操作行独立、按钮等宽等高
+        root.addView(TextView(ctx).apply {
+            text = "提醒与计划"
+            textSize = 22f
+            includeFontPadding = false
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setTextColor(colorRes(R.color.dsh_text_primary))
+        })
+        root.addView(LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(12), 0, 0)
+            addView(pill("＋ 新增", true) { showAddReminderDialog() },
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1.6f))
+            addView(pill("导入", false) { importReminders() },
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                    .apply { leftMargin = dp(8) })
+            addView(pill("导出", false) { exportReminders() },
+                LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                    .apply { leftMargin = dp(8) })
+        })
+        // 搜索 + 排序（本地即时过滤，不落盘）
+        val searchEt = EditText(ctx).apply {
+            hint = "搜索标题 / 步骤 / 标签"
+            textSize = 14f
+            setSingleLine(true)
+            setText(reminderQuery)
+            setTextColor(colorRes(R.color.dsh_text_input))
+            setHintTextColor(colorRes(R.color.dsh_text_faint))
+            background = roundRect(colorRes(R.color.dsh_input_bg), PILL_RADIUS, colorRes(R.color.dsh_accent_stroke))
+            setPadding(dp(14), 0, dp(14), 0)
+            minHeight = dp(PILL_H)
+            gravity = Gravity.CENTER_VERTICAL
+            includeFontPadding = false
+            addTextChangedListener(object : android.text.TextWatcher {
+                override fun beforeTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun onTextChanged(s: CharSequence?, a: Int, b: Int, c: Int) {}
+                override fun afterTextChanged(s: android.text.Editable?) {
+                    val q = s?.toString().orEmpty()
+                    if (q != reminderQuery) {
+                        reminderQuery = q
+                        refreshReminderList()
+                    }
+                }
+            })
+        }
+        val sortChip = pill("排序", false) {
+            val opts = listOf("时间最近优先", "时间最晚优先", "按标题")
+            val vals = listOf("time_asc", "time_desc", "title")
+            showChoiceDialog("排序方式", opts, vals.indexOf(reminderSort).coerceAtLeast(0)) { i ->
+                reminderSort = vals[i]
+                refreshReminderList()
+            }
+        }
+        val statsChip = pill("统计", false) { showReminderStats() }
+        root.addView(LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(12), 0, 0)
+            addView(searchEt, LinearLayout.LayoutParams(0, dp(PILL_H), 1f))
+            addView(sortChip, LinearLayout.LayoutParams(dp(58), dp(PILL_H)).apply { leftMargin = dp(8) })
+            addView(statsChip, LinearLayout.LayoutParams(dp(58), dp(PILL_H)).apply { leftMargin = dp(8) })
+        })
+        // 首次用完左滑后自动隐藏的操作提示（SharedPreferences 记一次性）
+        reminderHintBar = TextView(ctx).apply {
+            text = "小提示：列表项左滑可「编辑 / 删除」，长按也能编辑"
+            textSize = 12.5f
+            setTextColor(colorRes(R.color.dsh_text_hint))
+            setPadding(dp(12), dp(9), dp(12), dp(9))
+            background = roundRect(colorRes(R.color.dsh_accent_soft), 12, colorRes(R.color.dsh_accent_stroke))
+            visibility = if (Store.prefBool(this@SettingsActivity, KEY_REMINDER_HINT_SHOWN, false))
+                View.GONE else View.VISIBLE
+        }
+        root.addView(reminderHintBar, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT
+        ).apply { topMargin = dp(10) })
+        root.addView(TextView(ctx).apply {
+            text = "到点桌宠旁会弹气泡，点气泡可回来查看 / 勾选。"
+            textSize = 12.5f
+            setTextColor(colorRes(R.color.dsh_text_hint))
+            setPadding(0, dp(10), 0, 0)
+        })
+        reminderEmpty = TextView(ctx).apply {
+            text = "还没有提醒或计划，点上方「＋ 新增」建一个。"
+            textSize = 14f
+            setTextColor(colorRes(R.color.dsh_text_faint))
+            gravity = Gravity.CENTER
+            setPadding(dp(24), dp(14), dp(24), 0)
+        }
+        // 空状态插画：自绘表盘（圆环 + 指针），不使用 emoji，配色跟主题走
+        val emptyArt = object : View(ctx) {
+            private val ring = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                style = android.graphics.Paint.Style.STROKE
+                strokeWidth = dp(2).toFloat()
+                color = colorRes(R.color.dsh_accent_stroke)
+            }
+            private val hand = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                style = android.graphics.Paint.Style.STROKE
+                strokeWidth = dp(3).toFloat()
+                strokeCap = android.graphics.Paint.Cap.ROUND
+                color = colorRes(R.color.dsh_accent)
+            }
+            private val dot = android.graphics.Paint(android.graphics.Paint.ANTI_ALIAS_FLAG).apply {
+                style = android.graphics.Paint.Style.FILL
+                color = colorRes(R.color.dsh_accent_soft)
+            }
+
+            override fun onDraw(canvas: android.graphics.Canvas) {
+                super.onDraw(canvas)
+                val w = width.toFloat()
+                val h = height.toFloat()
+                if (w <= 0f || h <= 0f) return
+                val cx = w / 2f
+                val cy = h / 2f
+                val r = minOf(w, h) / 2f - dp(3)
+                canvas.drawCircle(cx, cy, r, ring)
+                canvas.drawCircle(cx, cy, r * 0.18f, dot)
+                canvas.drawLine(cx, cy, cx, cy - r * 0.58f, hand)
+                canvas.drawLine(cx, cy, cx + r * 0.44f, cy, hand)
+            }
+        }
+        reminderEmptyHost = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            gravity = Gravity.CENTER_HORIZONTAL
+            setPadding(0, dp(36), 0, dp(30))
+            addView(emptyArt, LinearLayout.LayoutParams(dp(84), dp(84)))
+            addView(reminderEmpty)
+        }
+        root.addView(reminderEmptyHost)
+        reminderListContainer = LinearLayout(ctx).apply { orientation = LinearLayout.VERTICAL }
+        root.addView(reminderListContainer)
+        return root
+    }
+
+    /**
+     * 刷新提醒列表。改进点：
+     *  ·未完成项（含逾期）正常列出，已完成项收进「已完成 N」折叠分组（默认折叠）——列表不被历史占满；
+     *  ·逾期项（pending 且已过点）单独标红分组优先展示，视觉上一眼能看出来；
+     *  · 构建过程仍是顺序 addView（不引 RecyclerView 依赖），但折叠后实际渲染条目大幅减少，
+     *    20+ 条时开销比原来「全量卡片常驻」明显小；
+     *  · 倒计时 tick 只挂真正有未完成倒计时的项。
+     */
+    fun refreshReminderList() {
+        countdownLabels.clear()
+        countdownTargets.clear()
+        main.removeCallbacks(cdTick)
+        val all = Reminder.load(Store.readReminders(this))
+        val q = reminderQuery.trim().lowercase()
+        val list = if (q.isEmpty()) all else all.filter { r ->
+            r.title.lowercase().contains(q) ||
+                r.tags.any { it.lowercase().contains(q) } ||
+                r.steps.any { it.text.lowercase().contains(q) }
+        }
+        reminderListContainer.removeAllViews()
+        reminderEmpty.text = when {
+            all.isEmpty() -> "还没有提醒或计划，点上方「＋ 新增」建一个。"
+            list.isEmpty() -> "没有匹配「$q」的提醒。"
+            else -> ""
+        }
+        val emptyNow = list.isEmpty()
+        reminderEmpty.visibility = if (emptyNow) View.VISIBLE else View.GONE
+        reminderEmptyHost?.visibility = if (emptyNow) View.VISIBLE else View.GONE
+        val fmt = SimpleDateFormat("MM-dd HH:mm", Locale.getDefault())
+        val now = System.currentTimeMillis()
+
+        // 三组：逾期（pending 已过点） / 待触发 / 已完成
+        val overdue = ArrayList<Reminder>()
+        val upcoming = ArrayList<Reminder>()
+        val doneList = ArrayList<Reminder>()
+        for (r in list) {
+            when {
+                r.status == Reminder.STATUS_DONE -> doneList.add(r)
+                r.timeMs in 1..now && r.status == Reminder.STATUS_PENDING -> overdue.add(r)
+                else -> upcoming.add(r)
+            }
+        }
+
+        // 组内排序（分组语义不变：逾期置顶 / 接下来 / 已完成折叠）
+        val cmp: Comparator<Reminder> = when (reminderSort) {
+            "time_desc" -> compareByDescending { it.timeMs }
+            "title" -> compareBy { it.title.lowercase() }
+            else -> compareBy { it.timeMs }
+        }
+        overdue.sortWith(cmp)
+        upcoming.sortWith(cmp)
+        doneList.sortWith(cmp)
+
+        fun addItem(r: Reminder) {
+            val item = buildReminderItemView(r, fmt)
+            reminderListContainer.addView(item, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dp(8) })
+        }
+
+        // 逾期组（标题 + 条目）
+        if (overdue.isNotEmpty()) {
+            reminderListContainer.addView(groupHeader("已到点 · ${overdue.size}", colorRes(R.color.dsh_danger)))
+            overdue.forEach { addItem(it) }
+        }
+        // 待触发 / 进行中
+        if (upcoming.isNotEmpty()) {
+            if (overdue.isNotEmpty()) {
+                reminderListContainer.addView(groupHeader("接下来", colorRes(R.color.dsh_section_title)))
+            }
+            upcoming.forEach { addItem(it) }
+        }
+        // 已完成（折叠）
+        if (doneList.isNotEmpty()) {
+            val header = groupHeader(
+                "已完成 · ${doneList.size}" + if (doneGroupExpanded) "" else "（点开查看）",
+                colorRes(R.color.dsh_text_faint),
+            )
+            header.setOnClickListener {
+                doneGroupExpanded = !doneGroupExpanded
+                refreshReminderList()
+            }
+            reminderListContainer.addView(header)
+            if (doneGroupExpanded) doneList.forEach { addItem(it) }
+        }
+
+        main.postDelayed({ ReminderScheduler.armAll(this@SettingsActivity) }, 200L)
+        // 数据变了→同步刷新桌面小组件（没放置时直接 return，开销可忽略）
+        try { ReminderWidgetProvider.refresh(this) } catch (e: Exception) { }
+        if (countdownLabels.isNotEmpty()) main.postDelayed(cdTick, 1000L)
+    }
+
+    /** 提醒统计弹窗：总量 / 待办 / 逾期 / 已完成 / 本周到期 / 计划步骤完成率。 */
+    private fun showReminderStats() {
+        val ctx = this@SettingsActivity
+        val list = Reminder.load(Store.readReminders(this))
+        if (list.isEmpty()) {
+            Toast.makeText(ctx, "还没有提醒可统计", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val now = System.currentTimeMillis()
+        val weekLater = now + 7L * 24 * 3600 * 1000
+        val done = list.count { it.status == Reminder.STATUS_DONE }
+        val overdue = list.count {
+            it.status != Reminder.STATUS_DONE && it.timeMs in 1..now
+        }
+        val triggered = list.count {
+            it.status == Reminder.STATUS_TRIGGERED && it.timeMs !in 1..now
+        }
+        val pending = list.size - done - overdue - triggered
+        val thisWeek = list.count { it.timeMs in now..weekLater }
+        val stepTotal = list.sumOf { it.steps.size }
+        val stepDone = list.sumOf { r -> r.steps.count { it.done } }
+        val plans = list.count { it is Reminder.Plan }
+
+        val card = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundRect(colorRes(R.color.dsh_bg_card), 22, 0)
+            setPadding(dp(18), dp(16), dp(18), dp(16))
+        }
+        card.addView(TextView(ctx).apply {
+            text = "提醒统计"
+            textSize = 16f
+            includeFontPadding = false
+            setTextColor(colorRes(R.color.dsh_text_primary))
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setPadding(0, 0, 0, dp(12))
+        })
+        val rows = listOf(
+            "总数" to "${list.size} 条（计划 $plans 条）",
+            "待触发" to "$pending 条",
+            "进行中" to "$triggered 条",
+            "已到点未处理" to "$overdue 条",
+            "已完成" to "$done 条",
+            "未来 7 天到期" to "$thisWeek 条",
+            "步骤完成度" to if (stepTotal == 0) "—" else "$stepDone / $stepTotal",
+        )
+        for ((k, v) in rows) {
+            val row = LinearLayout(ctx).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                setPadding(0, dp(8), 0, dp(8))
+            }
+            row.addView(TextView(ctx).apply {
+                text = k
+                textSize = 14f
+                setTextColor(colorRes(R.color.dsh_text_secondary))
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            row.addView(TextView(ctx).apply {
+                text = v
+                textSize = 14f
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+                setTextColor(
+                    if (k.startsWith("已到点") && overdue > 0) colorRes(R.color.dsh_danger)
+                    else colorRes(R.color.dsh_text_primary)
+                )
+            })
+            card.addView(row)
+        }
+        val dlg = android.app.Dialog(ctx)
+        dlg.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+        dlg.setContentView(card)
+        dlg.window?.setLayout(
+            (ctx.resources.displayMetrics.widthPixels * 0.8).toInt(),
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        dlg.window?.setBackgroundDrawable(ColorDrawable(0x00000000.toInt()))
+        dlg.show()
+    }
+
+    /** 分组小标题（可点击的分组头也用它）。 */
+    private fun groupHeader(text: String, color: Int): TextView = TextView(this).apply {
+        this.text = text
+        textSize = 12.5f
+        setTextColor(color)
+        setTypeface(typeface, android.graphics.Typeface.BOLD)
+        includeFontPadding = false
+        setPadding(dp(4), dp(12), dp(4), dp(4))
+    }
+
+    /** 用户第一次用左滑/长按后调用：永久隐藏操作提示条。 */
+    private fun hideReminderHintOnce() {
+        if (Store.prefBool(this, KEY_REMINDER_HINT_SHOWN, false)) return
+        Store.prefSet(this, KEY_REMINDER_HINT_SHOWN, true)
+        reminderHintBar?.visibility = View.GONE
+    }
+
+    /** 导出提醒/计划（三种格式：JSON 备份 / Markdown 清单 / 日历 .ics），均走 SAF、无需存储权限。 */
+    private fun exportReminders() {
+        val json = Store.readReminders(this)
+        if (json.isBlank()) {
+            Toast.makeText(this, "还没有提醒可导出", Toast.LENGTH_SHORT).show()
+            return
+        }
+        val list = Reminder.load(json)
+        showChoiceDialog(
+            "导出格式", listOf("JSON 备份（可再导入）", "Markdown 清单（.md）", "日历文件（.ics）"), 0
+        ) { which ->
+            when (which) {
+                0 -> createExportDoc("dsh-pet-reminders.json", "application/json", null)
+                1 -> createExportDoc(
+                    "dsh-pet-reminders.md", "text/markdown", buildMarkdownExport(list)
+                )
+                else -> createExportDoc(
+                    "dsh-pet-reminders.ics", "text/calendar", buildIcsExport(list)
+                )
+            }
         }
     }
+
+    /** 拉起 SAF 新建文档；text 为 null 时表示「用当前 reminders.json 原样导出」（json 备份分支）。 */
+    private fun createExportDoc(name: String, mime: String, text: String?) {
+        pendingExportText = text ?: ""
+        val code = if (text == null) REQ_EXPORT_REMINDERS else REQ_EXPORT_TEXT
+        try {
+            val i = Intent(Intent.ACTION_CREATE_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = mime
+                putExtra(Intent.EXTRA_TITLE, name)
+            }
+            startActivityForResult(i, code)
+        } catch (e: Exception) {
+            Toast.makeText(this, "无法打开文件选择器：${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /** Markdown 清单：未完成在前（含逾期标记），已完成折叠到文末。 */
+    private fun buildMarkdownExport(list: List<Reminder>): String {
+        val fmt = SimpleDateFormat("yyyy-MM-dd HH:mm", Locale.getDefault())
+        val now = System.currentTimeMillis()
+        val sb = StringBuilder()
+        sb.append("# 提醒与计划\n\n")
+        sb.append("> 导出自 DSH 桌宠 · ").append(fmt.format(java.util.Date(now))).append("\n\n")
+        val pending = list.filter { it.status != Reminder.STATUS_DONE }
+        val done = list.filter { it.status == Reminder.STATUS_DONE }
+        sb.append("## 待办（").append(pending.size).append("）\n\n")
+        if (pending.isEmpty()) sb.append("_无_\n\n")
+        for (r in pending) {
+            val overdue = r.timeMs in 1..now
+            sb.append("- [ ] **").append(r.title).append("**")
+            if (r.timeMs > 0) sb.append(" — ").append(fmt.format(java.util.Date(r.timeMs)))
+            if (overdue) sb.append(" · 已到期")
+            if (r.repeat != Reminder.REPEAT_NONE)
+                sb.append("（").append(Reminder.repeatLabel(r.repeat)).append("）")
+            if (r.advanceMin > 0) sb.append("（提前").append(r.advanceMin).append("分钟）")
+            if (r.tags.isNotEmpty())
+                sb.append(" ").append(r.tags.joinToString(" ") { "#" + it })
+            sb.append("\n")
+            for (st in r.steps)
+                sb.append("  - [").append(if (st.done) "x" else " ").append("] ")
+                    .append(st.text).append("\n")
+        }
+        sb.append("\n## 已完成（").append(done.size).append("）\n\n")
+        if (done.isEmpty()) sb.append("_无_\n")
+        for (r in done) {
+            sb.append("- [x] ").append(r.title)
+            if (r.timeMs > 0) sb.append(" — ").append(fmt.format(java.util.Date(r.timeMs)))
+            sb.append("\n")
+        }
+        return sb.toString()
+    }
+
+    /** 日历 .ics（RFC 5545）：每条一个 VEVENT，重复项带 RRULE，提前提醒带 VALARM。 */
+    private fun buildIcsExport(list: List<Reminder>): String {
+        fun esc(v: String) = v.replace("\\", "\\\\").replace(";", "\\;").replace(",", "\\,")
+            .replace("\r", "").replace("\n", "\\n")
+        val fmt = SimpleDateFormat("yyyyMMdd'T'HHmmss'Z'", Locale.US).apply {
+            timeZone = java.util.TimeZone.getTimeZone("UTC")
+        }
+        val sb = StringBuilder()
+        sb.append("BEGIN:VCALENDAR\r\n")
+        sb.append("VERSION:2.0\r\n")
+        sb.append("PRODID:-//DSH Pet//Reminders//CN\r\n")
+        sb.append("CALSCALE:GREGORIAN\r\n")
+        val stamp = fmt.format(java.util.Date())
+        for (r in list) {
+            if (r.timeMs <= 0) continue
+            sb.append("BEGIN:VEVENT\r\n")
+            sb.append("UID:").append(r.id).append("@dsh-pet\r\n")
+            sb.append("DTSTAMP:").append(stamp).append("\r\n")
+            sb.append("DTSTART:").append(fmt.format(java.util.Date(r.timeMs))).append("\r\n")
+            sb.append("DURATION:PT15M\r\n")
+            sb.append("SUMMARY:").append(esc(r.title)).append("\r\n")
+            var desc = "状态：" + when (r.status) {
+                Reminder.STATUS_DONE -> "已完成"
+                Reminder.STATUS_TRIGGERED -> "进行中"
+                else -> "待触发"
+            }
+            if (r.steps.isNotEmpty()) {
+                desc += "\n步骤：" + r.steps.joinToString("; ") {
+                    (if (it.done) "[x] " else "[ ] ") + it.text
+                }
+            }
+            if (r.tags.isNotEmpty()) desc += "\n标签：" + r.tags.joinToString(" ")
+            sb.append("DESCRIPTION:").append(esc(desc)).append("\r\n")
+            when (r.repeat) {
+                Reminder.REPEAT_DAILY -> sb.append("RRULE:FREQ=DAILY\r\n")
+                Reminder.REPEAT_WEEKLY -> sb.append("RRULE:FREQ=WEEKLY\r\n")
+                Reminder.REPEAT_WEEKDAYS ->
+                    sb.append("RRULE:FREQ=WEEKLY;BYDAY=MO,TU,WE,TH,FR\r\n")
+                Reminder.REPEAT_MONTHLY -> sb.append("RRULE:FREQ=MONTHLY\r\n")
+            }
+            if (r.advanceMin > 0) {
+                sb.append("BEGIN:VALARM\r\n")
+                sb.append("TRIGGER:-PT").append(r.advanceMin).append("M\r\n")
+                sb.append("ACTION:DISPLAY\r\n")
+                sb.append("DESCRIPTION:").append(esc(r.title)).append("\r\n")
+                sb.append("END:VALARM\r\n")
+            }
+            sb.append("END:VEVENT\r\n")
+        }
+        sb.append("END:VCALENDAR\r\n")
+        return sb.toString()
+    }
+
+    /** 从用户选的文件导入提醒（合并去重：同 id 保留本地；新 id 追加）。 */
+    private fun importReminders() {
+        try {
+            val i = Intent(Intent.ACTION_OPEN_DOCUMENT).apply {
+                addCategory(Intent.CATEGORY_OPENABLE)
+                type = "*/*"
+            }
+            startActivityForResult(i, REQ_IMPORT_REMINDERS)
+        } catch (e: Exception) {
+            Toast.makeText(this, "无法打开文件选择器：${e.message}", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    /** 删除并给出 4 秒「撤销」窗口（撤销恢复整表快照，含原状态与步骤）。
+     *  提示条以「底部悬浮」形式叠在内容区底部，使用专门的 snack 色（暗黑模式自动切换），
+     *  不再往列表里插一行，也不占用列表布局。 */
+    private fun deleteWithUndo(r: Reminder) {
+        val before = Store.readReminders(this)
+        ReminderScheduler.remove(this, r.id)
+        refreshReminderList()
+        undoSnapshot = before
+        undoTimer?.let { main.removeCallbacks(it) }
+
+        val host = snackOverlay ?: return
+        snackBar?.let { host.removeView(it) }
+        // 提示条本身不消费整屏触摸（clickable=false），只有「撤销」按钮可点
+        val bar = LinearLayout(this).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = roundRect(colorRes(R.color.dsh_snack_bg), 16, 0)
+            elevation = dp(8).toFloat()
+            setPadding(dp(16), dp(12), dp(10), dp(12))
+            isClickable = false
+        }
+        bar.addView(TextView(this).apply {
+            text = "已删除「${r.title}」"
+            textSize = 13.5f
+            setTextColor(colorRes(R.color.dsh_snack_fg))
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        bar.addView(TextView(this).apply {
+            text = "撤销"
+            textSize = 13.5f
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setTextColor(colorRes(R.color.dsh_snack_action))
+            setPadding(dp(14), dp(6), dp(10), dp(6))
+            setOnClickListener {
+                val snap = undoSnapshot
+                if (!snap.isNullOrEmpty()) {
+                    Store.writeReminders(this@SettingsActivity, snap)
+                    ReminderScheduler.armAll(this@SettingsActivity)
+                    refreshReminderList()
+                    Toast.makeText(this@SettingsActivity, "已撤销删除", Toast.LENGTH_SHORT).show()
+                }
+                undoSnapshot = null
+                dismissSnackBar()
+            }
+        })
+        val lp = android.widget.FrameLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            Gravity.BOTTOM,
+        ).apply {
+            leftMargin = dp(16)
+            rightMargin = dp(16)
+            bottomMargin = dp(16)
+        }
+        host.addView(bar, lp)
+        snackBar = bar
+        // 入场：淡入 + 上滑 12dp
+        bar.alpha = 0f
+        bar.translationY = dp(12).toFloat()
+        bar.animate().alpha(1f).translationY(0f).setDuration(180L).start()
+
+        val hide = object : Runnable {
+            override fun run() {
+                dismissSnackBar()
+                undoSnapshot = null
+            }
+        }
+        undoTimer = hide
+        main.postDelayed(hide, 4000L)
+    }
+
+    /** 收起底部悬浮提示条（带退场动画，结束后从宿主移除）。 */
+    private fun dismissSnackBar() {
+        val b = snackBar ?: return
+        snackBar = null
+        b.animate().alpha(0f).translationY(dp(12).toFloat()).setDuration(160L)
+            .withEndAction { (b.parent as? android.view.ViewGroup)?.removeView(b) }
+            .start()
+    }
+
+
+    /** 单条提醒卡片：标题 + 时间 + 状态徽章 + 步骤（plan）+ 删除按钮。 */
+    /** 单条提醒卡片：紧凑 + 视觉对齐。
+     *  · 顶行：标题（左，省略号）+ 状态徽章（右）
+     *  · 信息行：时间（左）+ 步骤进度（右，plan 才显示），基线对齐
+     *  · 步骤：统一缩进（与标题左缘对齐），当前进行中步骤右侧标记「进行中」
+     *  · 底行：删除按钮靠右、小号、危险色背景
+     */
+    /** 免打扰时段的展示文案。 */
+    private fun quietRangeText(): String {
+        val s = Store.prefInt(this, "quietStart", 23)
+        val e = Store.prefInt(this, "quietEnd", 7)
+        return String.format("免打扰时段：%02d:00 - %02d:00", s, e)
+    }
+
+    /** 免打扰时段设置：两个滚轮（开始 / 结束）并排，松手吸附、跨格有咔哒声，一次设完。 */
+    private fun showQuietHoursDialog() {
+        val ctx = this@SettingsActivity
+        // 顶部预览：滚轮一动就更新，确认前就能看清最终时段
+        val preview = TextView(ctx).apply {
+            text = String.format(
+                "%02d:00 至 %02d:00，此期间不响铃不震动",
+                Store.prefInt(ctx, "quietStart", 23), Store.prefInt(ctx, "quietEnd", 7),
+            )
+            textSize = 12.5f
+            setTextColor(colorRes(R.color.dsh_text_hint))
+            setPadding(0, 0, 0, dp(14))
+        }
+        fun makePicker(init: Int) = android.widget.NumberPicker(ctx).apply {
+            minValue = 0
+            maxValue = 23
+            wrapSelectorWheel = true
+            value = init.coerceIn(0, 23)
+            setFormatter { v -> String.format("%02d:00", v) }
+            descendantFocusability = android.widget.NumberPicker.FOCUS_BLOCK_DESCENDANTS
+            // 暗色模式：NumberPicker 内部文字是默认黑，需要逐个子 View 刷成主题色
+            post {
+                val color = colorRes(R.color.dsh_text_primary)
+                for (i in 0 until childCount) {
+                    val c = getChildAt(i)
+                    if (c is TextView) c.setTextColor(color)
+                }
+            }
+        }
+        val startPicker = makePicker(Store.prefInt(ctx, "quietStart", 23))
+        val endPicker = makePicker(Store.prefInt(ctx, "quietEnd", 7))
+        val startLabel = TextView(ctx).apply {
+            text = "开始"
+            textSize = 12f
+            setTextColor(colorRes(R.color.dsh_text_faint))
+            gravity = Gravity.CENTER
+        }
+        val endLabel = TextView(ctx).apply {
+            text = "结束"
+            textSize = 12f
+            setTextColor(colorRes(R.color.dsh_text_faint))
+            gravity = Gravity.CENTER
+        }
+        fun syncPreview() {
+            preview.text = String.format(
+                "%02d:00 至 %02d:00，此期间不响铃不震动",
+                startPicker.value, endPicker.value,
+            )
+        }
+        startPicker.setOnValueChangedListener { _, _, _ -> syncPreview() }
+        endPicker.setOnValueChangedListener { _, _, _ -> syncPreview() }
+
+        val card = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundRect(colorRes(R.color.dsh_bg_card), 24, 0)
+            setPadding(dp(16), dp(16), dp(16), dp(14))
+        }
+        card.addView(TextView(ctx).apply {
+            text = "免打扰时段"
+            textSize = 17f
+            includeFontPadding = false
+            setTextColor(colorRes(R.color.dsh_text_primary))
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setPadding(dp(4), 0, dp(4), dp(4))
+        })
+        card.addView(preview)
+        // 两列滚轮：各占一半宽度，中间「至」分隔，视觉居中对称
+        card.addView(LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            background = roundRect(colorRes(R.color.dsh_input_bg), 16, colorRes(R.color.dsh_accent_stroke))
+            setPadding(dp(6), dp(8), dp(6), dp(8))
+            addView(LinearLayout(ctx).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(startLabel, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+                addView(startPicker, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, dp(150)))
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(TextView(ctx).apply {
+                text = "至"
+                textSize = 13f
+                setTextColor(colorRes(R.color.dsh_text_hint))
+                setPadding(dp(10), 0, dp(10), 0)
+            })
+            addView(LinearLayout(ctx).apply {
+                orientation = LinearLayout.VERTICAL
+                addView(endLabel, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+                addView(endPicker, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, dp(150)))
+            }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        }, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        card.addView(TextView(ctx).apply {
+            text = "支持跨天，例如 23:00 - 07:00"
+            textSize = 12f
+            setTextColor(colorRes(R.color.dsh_text_faint))
+            setPadding(dp(4), dp(10), dp(4), 0)
+        })
+        val btnRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, dp(16), 0, 0)
+        }
+        val cancelBtn = pill("取消", false) { }
+        val saveBtn = pill("保存", true) { }
+        btnRow.addView(cancelBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        btnRow.addView(saveBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            .apply { leftMargin = dp(12) })
+        card.addView(btnRow)
+
+        val dlg = android.app.Dialog(ctx)
+        dlg.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+        dlg.setContentView(card)
+        dlg.window?.setLayout(
+            (ctx.resources.displayMetrics.widthPixels * 0.9).toInt(),
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        )
+        dlg.window?.setBackgroundDrawable(ColorDrawable(0x00000000.toInt()))
+        cancelBtn.setOnClickListener { dlg.dismiss() }
+        saveBtn.setOnClickListener {
+            Store.prefSetInt(ctx, "quietStart", startPicker.value)
+            Store.prefSetInt(ctx, "quietEnd", endPicker.value)
+            // 改完时段立刻回写界面文本：重新加载设置页可能打断滚动，这里只更新摘要
+            quietSummaryView?.text = quietRangeText()
+            Toast.makeText(ctx, quietRangeText(), Toast.LENGTH_SHORT).show()
+            dlg.dismiss()
+        }
+        dlg.show()
+    }
+
+    /** 通用单选弹窗：卡片风格、选项竖排、点选即回调并关闭（用于重复规则 / 提前提醒时长等）。 */
+    private fun showChoiceDialog(
+        title: String,
+        labels: List<String>,
+        selected: Int,
+        onPick: (Int) -> Unit,
+    ) {
+        val ctx = this@SettingsActivity
+        val card = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundRect(colorRes(R.color.dsh_bg_card), 22, 0)
+            setPadding(dp(16), dp(16), dp(16), dp(14))
+        }
+        card.addView(TextView(ctx).apply {
+            text = title
+            textSize = 16f
+            includeFontPadding = false
+            setTextColor(colorRes(R.color.dsh_text_primary))
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+            setPadding(dp(2), 0, 0, dp(12))
+        })
+        val dlg = android.app.Dialog(ctx)
+        labels.forEachIndexed { i, label ->
+            card.addView(TextView(ctx).apply {
+                text = label
+                textSize = 14.5f
+                setTextColor(
+                    if (i == selected) colorRes(R.color.dsh_accent)
+                    else colorRes(R.color.dsh_text_primary)
+                )
+                gravity = Gravity.CENTER_VERTICAL
+                includeFontPadding = false
+                minHeight = dp(PILL_H)
+                setPadding(dp(14), dp(12), dp(14), dp(12))
+                background = roundRect(
+                    colorRes(R.color.dsh_input_bg), PILL_RADIUS,
+                    if (i == selected) colorRes(R.color.dsh_accent) else 0,
+                )
+                setOnClickListener {
+                    onPick(i)
+                    dlg.dismiss()
+                }
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+            ).apply { topMargin = dp(8) })
+        }
+        dlg.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+        dlg.setContentView(card)
+        dlg.window?.setLayout(
+            (ctx.resources.displayMetrics.widthPixels * 0.72).toInt(),
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        dlg.window?.setBackgroundDrawable(ColorDrawable(0x00000000.toInt()))
+        dlg.show()
+    }
+
+    private fun buildReminderItemView(r: Reminder, fmt: SimpleDateFormat): View {
+        val ctx = this@SettingsActivity
+        val card = card { }
+        card.removeAllViews()
+        // 紧凑化：提醒列表项专用小内边距 + 小项间距（memo 单条高度约 90dp → 60dp）
+        card.setPadding(dp(12), dp(8), dp(12), dp(8))
+        (card.layoutParams as? LinearLayout.LayoutParams)?.topMargin = dp(8)
+        val isDone = r.status == Reminder.STATUS_DONE
+        val isOverdue = !isDone && r.timeMs > 0 && r.timeMs <= System.currentTimeMillis()
+        // 逾期项：整卡左侧红色色条 + 淡红描边，扫一眼就能看出哪些过期了
+        if (isOverdue) {
+            val g = android.graphics.drawable.GradientDrawable().apply {
+                shape = android.graphics.drawable.GradientDrawable.RECTANGLE
+                cornerRadius = dp(20).toFloat()
+                setColor(colorRes(R.color.dsh_bg_card))
+                setStroke(dp(1), colorRes(R.color.dsh_danger))
+            }
+            card.background = g
+        }
+        val plan = r as? Reminder.Plan
+        val doneCount = plan?.steps?.count { it.done } ?: 0
+        val nextIdx = plan?.steps?.indexOfFirst { !it.done } ?: -1
+
+        // 顶行：标题（左，可省略） + 徽章 + 删除小按钮（右，不再独占一行）
+        val headRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        headRow.addView(TextView(ctx).apply {
+            text = r.title
+            textSize = 15f
+            maxLines = 1
+            ellipsize = android.text.TextUtils.TruncateAt.END
+            setTextColor(if (isDone) colorRes(R.color.dsh_text_faint) else colorRes(R.color.dsh_text_primary))
+            paintFlags = if (isDone) Paint.STRIKE_THRU_TEXT_FLAG else 0
+            setTypeface(typeface, android.graphics.Typeface.BOLD)
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        headRow.addView(statusBadge(r), LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { leftMargin = dp(8) })
+        card.addView(headRow)
+        //（删除按钮改为「左滑露出」，顶行不再放删除）
+
+        // 信息行：时间（左） + 步骤进度（右，仅 plan）—— 同一行两端对齐
+        val timeLabel = when {
+            r.timeMs <= 0 -> "未设时间"
+            isDone -> "已完成 · ${fmt.format(java.util.Date(r.timeMs))}"
+            else -> "${fmt.format(java.util.Date(r.timeMs))}"
+        }
+        val metaRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(0, dp(4), 0, 0)
+        }
+        metaRow.addView(TextView(ctx).apply {
+            text = timeLabel
+            textSize = 12.5f
+            setTextColor(colorRes(R.color.dsh_text_hint))
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        // 重复 / 提前提醒标记（只有设置了才显示，避免占用视觉噪音）
+        val repeatTag = buildString {
+            if (r.repeat != Reminder.REPEAT_NONE) append(Reminder.repeatLabel(r.repeat))
+            if (r.advanceMin > 0) {
+                if (isNotEmpty()) append(" · ")
+                append("提前${r.advanceMin}分")
+            }
+        }
+        if (r.tags.isNotEmpty()) {
+            metaRow.addView(TextView(ctx).apply {
+                text = r.tags.joinToString(" · ") { "#$it" }
+                textSize = 11f
+                maxLines = 1
+                ellipsize = android.text.TextUtils.TruncateAt.END
+                setTextColor(colorRes(R.color.dsh_text_secondary))
+                setPadding(dp(6), dp(1), dp(6), dp(1))
+                background = roundRect(colorRes(R.color.dsh_input_bg), 8, 0)
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { leftMargin = dp(8) })
+        }
+        if (repeatTag.isNotEmpty()) {
+            metaRow.addView(TextView(ctx).apply {
+                text = repeatTag
+                textSize = 11f
+                setTextColor(colorRes(R.color.dsh_accent))
+                setPadding(dp(6), dp(1), dp(6), dp(1))
+                background = roundRect(colorRes(R.color.dsh_accent_soft), 8, 0)
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT
+            ).apply { leftMargin = dp(8) })
+        }
+        // 自适应倒计时（cdTick 每秒刷新：<12h 精确到秒；未到点变强调色）
+        if (r.timeMs > 0 && !isDone) {
+            val cd = TextView(ctx).apply {
+                text = countdownText(r.timeMs)
+                textSize = 12.5f
+                setTextColor(colorRes(R.color.dsh_text_hint))
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+            }
+            metaRow.addView(cd, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { leftMargin = dp(10) })
+            countdownLabels.add(cd)
+            countdownTargets.add(r.timeMs)
+        }
+        if (plan != null && plan.steps.isNotEmpty()) {
+            metaRow.addView(TextView(ctx).apply {
+                text = "步骤 $doneCount/${plan.steps.size}"
+                textSize = 12f
+                setTextColor(if (plan.allDone) colorRes(R.color.dsh_success) else colorRes(R.color.dsh_accent))
+                setTypeface(typeface, android.graphics.Typeface.BOLD)
+            }, LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { leftMargin = dp(10) })
+            // 一键全部完成（步骤多时免去逐条勾选；二次确认避免误触）
+            if (!plan.allDone && !isDone) {
+                metaRow.addView(TextView(ctx).apply {
+                    text = "全部完成"
+                    textSize = 11.5f
+                    setTextColor(colorRes(R.color.dsh_success))
+                    setTypeface(typeface, android.graphics.Typeface.BOLD)
+                    setPadding(dp(6), dp(1), dp(6), dp(1))
+                    background = roundRect(colorRes(R.color.dsh_success_bg), 8, 0)
+                    setOnClickListener {
+                        android.app.AlertDialog.Builder(ctx)
+                            .setMessage("把这 ${plan.steps.size} 个步骤全部勾完？")
+                            .setPositiveButton("全部完成") { _, _ ->
+                                ReminderScheduler.markAllStepsDone(ctx, r.id)
+                                refreshReminderList()
+                                Toast.makeText(ctx, "已全部完成", Toast.LENGTH_SHORT).show()
+                            }
+                            .setNegativeButton("取消", null)
+                            .show()
+                    }
+                }, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { leftMargin = dp(8) })
+            }
+        }
+        card.addView(metaRow)
+
+        // 步骤列表：统一缩进，与标题左缘对齐
+        if (plan != null && plan.steps.isNotEmpty()) {
+            val stepHost = LinearLayout(ctx).apply {
+                orientation = LinearLayout.VERTICAL
+                setPadding(dp(4), dp(3), 0, 0)
+            }
+            for ((i, st) in plan.steps.withIndex()) {
+                val enabled = st.done || i == nextIdx
+                val srow = LinearLayout(ctx).apply {
+                    orientation = LinearLayout.HORIZONTAL
+                    gravity = Gravity.CENTER_VERTICAL
+                    setPadding(0, dp(3), 0, 0)
+                }
+                val cb = CheckBox(ctx).apply {
+                    text = st.text
+                    textSize = 13.5f
+                    maxLines = 1
+                    ellipsize = android.text.TextUtils.TruncateAt.END
+                    isChecked = st.done
+                    isEnabled = enabled
+                    setTextColor(if (st.done) colorRes(R.color.dsh_text_faint) else colorRes(R.color.dsh_text_secondary))
+                    setOnCheckedChangeListener { _, isChecked ->
+                        if (loading) return@setOnCheckedChangeListener
+                        if (!enabled) return@setOnCheckedChangeListener
+                        val newChecked = if (st.done) !isChecked else isChecked
+                        if (newChecked == st.done) return@setOnCheckedChangeListener
+                        ReminderScheduler.toggleStep(this@SettingsActivity, r.id, i)
+                        refreshReminderList()
+                    }
+                }
+                srow.addView(cb, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                if (i == nextIdx && !st.done) {
+                    srow.addView(TextView(ctx).apply {
+                        text = "进行中"
+                        textSize = 11f
+                        setTextColor(colorRes(R.color.dsh_accent))
+                        setPadding(0, 0, dp(4), 0)
+                        setTypeface(typeface, android.graphics.Typeface.BOLD)
+                    })
+                }
+                stepHost.addView(srow)
+            }
+            card.addView(stepHost)
+        }
+
+        // ===== 左滑露出「编辑 + 删除」（微信式）+ 长按弹编辑弹窗 =====
+        // 用自定义 ViewGroup（SwipeRowLayout）接管手势：DOWN 不拦截让子元素点击正常，
+        // 判定水平拖动才 intercept；长按与其解耦（任何位移立即取消）——修复「滑不动/误弹编辑窗」。
+        val row = SwipeRowLayout(ctx)
+        // 操作层：编辑 + 删除 两个按钮（显式入口，避免用户不知道长按可编辑）；平时 GONE，左滑才滑入
+        val editBtn = Button(ctx).apply {
+            text = "编辑"
+            textSize = 12f
+            isAllCaps = false
+            stateListAnimator = null
+            setTextColor(Color.WHITE)
+            background = roundRect(colorRes(R.color.dsh_accent), 10, 0)
+            setOnClickListener {
+                row.closeSwipe()
+                showEditReminderDialog(r)
+            }
+        }
+        val delBtn = Button(ctx).apply {
+            text = "删除"
+            textSize = 12f
+            isAllCaps = false
+            stateListAnimator = null
+            setTextColor(Color.WHITE)
+            background = roundRect(colorRes(R.color.dsh_danger), 10, 0)
+            setOnClickListener {
+                row.closeSwipe()
+                confirmDeleteReminder(r)
+            }
+        }
+        val actionBar = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            addView(editBtn, LinearLayout.LayoutParams(
+                dp(60), ViewGroup.LayoutParams.MATCH_PARENT))
+            addView(delBtn, LinearLayout.LayoutParams(
+                dp(60), ViewGroup.LayoutParams.MATCH_PARENT).apply { leftMargin = dp(5) })
+        }
+        (card.layoutParams as? ViewGroup.MarginLayoutParams)?.let { it.topMargin = 0 }
+        row.bind(card, actionBar, dp(125))
+        row.onLongPress = { hideReminderHintOnce(); showEditReminderDialog(r) }
+        row.onInteract = { hideReminderHintOnce() }
+        return row
+    }
+
+    /** 长按提醒项 → 编辑弹窗：改标题/时间 + 提醒方式开关（桌宠气泡 / 通知栏）+ 计划步骤二次编辑。 */
+    private fun showEditReminderDialog(r: Reminder) {
+        val ctx = this@SettingsActivity
+        val tf = android.graphics.Typeface.DEFAULT
+        val isPlan = r is Reminder.Plan
+        val card2 = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundRect(colorRes(R.color.dsh_bg_card), 24, 0)
+            setPadding(dp(4), dp(4), dp(4), dp(4))
+        }
+        val titleBar = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(16), dp(12), dp(6))
+        }
+        titleBar.addView(TextView(ctx).apply {
+            text = "编辑提醒"
+            textSize = 17f
+            setTextColor(colorRes(R.color.dsh_text_primary))
+            setTypeface(tf, android.graphics.Typeface.BOLD)
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val closeX = TextView(ctx).apply {
+            text = "✕"; textSize = 16f; gravity = Gravity.CENTER
+            setTextColor(colorRes(R.color.dsh_text_hint)); setPadding(dp(8), dp(8), dp(8), dp(8))
+        }
+        titleBar.addView(closeX)
+        card2.addView(titleBar)
+        val body = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(6), dp(20), dp(12))
+        }
+        // 标题
+        body.addView(desc("标题"))
+        val titleEt = EditText(ctx).apply {
+            hint = "提醒标题"; textSize = 14f; setSingleLine(true)
+            setTextColor(colorRes(R.color.dsh_text_input))
+            background = roundRect(colorRes(R.color.dsh_input_bg), 12, colorRes(R.color.dsh_accent_stroke))
+            setPadding(dp(12), dp(8), dp(12), dp(8)); setText(r.title)
+        }
+        body.addView(titleEt)
+        val tagsEt = EditText(ctx).apply {
+            hint = "标签（逗号分隔，可空）"; textSize = 14f; setSingleLine(true)
+            setTextColor(colorRes(R.color.dsh_text_input))
+            background = roundRect(colorRes(R.color.dsh_input_bg), 12, colorRes(R.color.dsh_accent_stroke))
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            setText(r.tags.joinToString(","))
+        }
+        body.addView(tagsEt)
+        // 时间
+        body.addView(desc("时间 / 日期"))
+        val wheel = TimeWheelView(ctx).apply {
+            layoutParams = LinearLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, dp(220))
+            val ldt = java.time.Instant.ofEpochMilli(r.timeMs)
+                .atZone(java.time.ZoneId.systemDefault()).toLocalDateTime()
+            setPicked(ldt.year, ldt.monthValue, ldt.dayOfMonth, ldt.hour, ldt.minute, ldt.second)
+        }
+        body.addView(wheel)
+        // 重复规则 / 提前提醒（同新建弹窗：两个 chip + 单选弹窗）
+        val repeatVals = listOf(
+            Reminder.REPEAT_NONE, Reminder.REPEAT_DAILY, Reminder.REPEAT_WEEKLY,
+            Reminder.REPEAT_WEEKDAYS, Reminder.REPEAT_MONTHLY,
+        )
+        val repeatTexts = repeatVals.map { Reminder.repeatLabel(it) }
+        val advVals = listOf(0, 5, 15, 30, 60)
+        val advTexts = listOf("准时", "提前 5 分钟", "提前 15 分钟", "提前 30 分钟", "提前 1 小时")
+        var selRepeat = repeatVals.firstOrNull { it == r.repeat } ?: Reminder.REPEAT_NONE
+        var selAdvMin = if (advVals.contains(r.advanceMin)) r.advanceMin else 0
+        var repeatChip: Button? = null
+        var advChip: Button? = null
+        repeatChip = pill("重复：${Reminder.repeatLabel(selRepeat)}", false) {
+            showChoiceDialog("重复", repeatTexts, repeatVals.indexOf(selRepeat)) { i ->
+                selRepeat = repeatVals[i]
+                repeatChip?.text = "重复：${repeatTexts[i]}"
+            }
+        }
+        advChip = pill("提前：${advTexts[advVals.indexOf(selAdvMin)]}", false) {
+            showChoiceDialog("提前提醒", advTexts, advVals.indexOf(selAdvMin)) { i ->
+                selAdvMin = advVals[i]
+                advChip?.text = "提前：${advTexts[i]}"
+            }
+        }
+        body.addView(LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(0, 0, 0, dp(6))
+            addView(repeatChip, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(advChip, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+                .apply { leftMargin = dp(8) })
+        })
+        body.addView(desc("提醒方式"))
+        val bubbleSw = Switch(ctx).apply {
+            text = "在桌宠旁弹气泡"; setTextColor(colorRes(R.color.dsh_text_primary)); textSize = 13.5f
+            isChecked = Reminder.showBubble(r)
+        }
+        val notifSw = Switch(ctx).apply {
+            text = "在通知栏显示"; setTextColor(colorRes(R.color.dsh_text_primary)); textSize = 13.5f
+            setPadding(0, dp(6), 0, 0); isChecked = Reminder.showNotification(r)
+        }
+        body.addView(bubbleSw); body.addView(notifSw)
+        // 计划步骤二次编辑（仅 plan）
+        val stepEdits = ArrayList<EditText>()
+        if (isPlan) {
+            val plan = r as Reminder.Plan
+            body.addView(desc("步骤（可改文本 / 删行）"))
+            for (s in plan.steps) {
+                val row = LinearLayout(ctx).apply {
+                    orientation = LinearLayout.HORIZONTAL; gravity = Gravity.CENTER_VERTICAL
+                }
+                val et = EditText(ctx).apply {
+                    hint = "步骤内容"; textSize = 14f; setSingleLine(true); setText(s.text)
+                    setTextColor(colorRes(R.color.dsh_text_input))
+                    background = roundRect(colorRes(R.color.dsh_input_bg), 12, colorRes(R.color.dsh_accent_stroke))
+                    setPadding(dp(12), dp(8), dp(12), dp(8))
+                }
+                row.addView(et, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+                val del = TextView(ctx).apply {
+                    text = "✕"; textSize = 17f; setTextColor(colorRes(R.color.dsh_danger)); setPadding(dp(10), 0, dp(2), 0)
+                }
+                del.setOnClickListener { body.removeView(row); stepEdits.remove(et) }
+                row.addView(del)
+                body.addView(row, LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT).apply { topMargin = dp(6) })
+                stepEdits.add(et)
+            }
+        }
+        // 把正文挂进卡片（此前漏挂导致弹窗只剩两个按钮！）——套一层 ScrollView 兜底，
+        // 步骤多时弹窗内部滚，高度封顶 85% 屏高
+        val bodyScroll = android.widget.ScrollView(ctx).apply {
+            isVerticalScrollBarEnabled = true
+            addView(body, android.view.ViewGroup.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        }
+        card2.addView(bodyScroll, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        // 保存
+        val saveRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(16), dp(12), dp(16), dp(16))
+        }
+        val cancelBtn = pill("取消", false) { }
+        val saveBtn = pill("保存", true) { }
+        saveRow.addView(cancelBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        saveRow.addView(saveBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(10) })
+        card2.addView(saveRow)
+        val dlg = android.app.Dialog(ctx)
+        dlg.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+        dlg.setContentView(card2, LinearLayout.LayoutParams(
+            (ctx.resources.displayMetrics.widthPixels * 0.9).toInt(), ViewGroup.LayoutParams.WRAP_CONTENT))
+        dlg.window?.setLayout(
+            (ctx.resources.displayMetrics.widthPixels * 0.9).toInt(), ViewGroup.LayoutParams.WRAP_CONTENT)
+        dlg.window?.setBackgroundDrawable(ColorDrawable(0x00000000.toInt()))
+        // 内容超高才封顶（动态步骤编辑）
+        val maxH = (ctx.resources.displayMetrics.heightPixels * 0.85).toInt()
+        closeX.setOnClickListener { dlg.dismiss() }
+        cancelBtn.setOnClickListener { dlg.dismiss() }
+        saveBtn.setOnClickListener {
+            val newTitle = titleEt.text.toString().trim()
+            if (newTitle.isEmpty()) {
+                Toast.makeText(ctx, "标题不能为空", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            val newTime = wheel.picked().toEpochMilli()
+            val sb = bubbleSw.isChecked
+            val sn = notifSw.isChecked
+            ReminderScheduler.update(ctx, r.id) { cur ->
+                when (cur) {
+                    is Reminder.Memo -> cur.copy(title = newTitle, timeMs = newTime,
+                        showBubble = sb, showNotification = sn,
+                        repeat = selRepeat, advanceMin = selAdvMin,
+                        tags = Reminder.parseTags(tagsEt.text.toString()))
+                    is Reminder.Plan -> {
+                        val newSteps = stepEdits.map { it.text.toString().trim() }
+                            .filter { it.isNotEmpty() }.map { Reminder.Step(it, cur.steps.firstOrNull()?.done ?: false) }
+                        cur.copy(title = newTitle, timeMs = newTime,
+                            showBubble = sb, showNotification = sn,
+                            repeat = selRepeat, advanceMin = selAdvMin,
+                            tags = Reminder.parseTags(tagsEt.text.toString()),
+                            steps = newSteps, status = if (cur.status == Reminder.STATUS_DONE && newSteps.isNotEmpty()) Reminder.STATUS_TRIGGERED else cur.status)
+                    }
+                }
+            }
+            refreshReminderList()
+            Toast.makeText(ctx, "已保存修改", Toast.LENGTH_SHORT).show()
+            dlg.dismiss()
+        }
+        dlg.show()
+        // 封顶时才切 bodyScroll 到「0 高 + weight」内部滚动；内容矮（备忘）保持 WRAP 贴合
+        card2.post {
+            if (card2.height > maxH) {
+                (card2.layoutParams as? LinearLayout.LayoutParams)?.height = maxH
+                (bodyScroll.layoutParams as? LinearLayout.LayoutParams)?.let {
+                    it.height = 0
+                    it.weight = 1f
+                }
+                card2.requestLayout()
+            }
+        }
+    }
+
+    /** 状态徽章：待触发 / 进行中 / 圆角小胶囊。 */
+    /** 自适应倒计时文案：≥30天→「N个月后」，≥48小时→「N天后」，≥12小时→「N小时后」，
+     *  <12小时→具体「X小时Y分Z秒」（不足1小时则「Y分Z秒」）；已到点/已过点→「已到点」。 */
+    private fun countdownText(timeMs: Long, nowMs: Long = System.currentTimeMillis()): String {
+        val delta = timeMs - nowMs
+        if (delta <= 0) return "已到点"
+        val days = delta / (24L * 3600 * 1000)
+        val hours = delta / (3600L * 1000)
+        return when {
+            days >= 30 -> "${(days + 29) / 30}个月后"
+            hours >= 48 -> "${days}天后"
+            hours >= 12 -> "${hours}小时后"
+            else -> {
+                val h = hours
+                val m = (delta % 3600000L) / 60000L
+                val sec = (delta % 60000L) / 1000L
+                if (h > 0) "${h}小时${m}分${sec}秒" else "${m}分${sec}秒"
+            }
+        }
+    }
+
+    private fun statusBadge(r: Reminder): View = TextView(this@SettingsActivity).apply {
+        val t: Triple<String, Int, Int> = when (r.status) {
+            Reminder.STATUS_DONE -> Triple("已完成", colorRes(R.color.dsh_success), colorRes(R.color.dsh_success_bg))
+            Reminder.STATUS_TRIGGERED -> {
+                val lbl = (r as? Reminder.Plan)?.let { if (it.allDone) "已完成" else "进行中" } ?: "进行中"
+                Triple(lbl, colorRes(R.color.dsh_warning), colorRes(R.color.dsh_warning_bg))
+            }
+            else -> Triple("待触发", colorRes(R.color.dsh_section_title), colorRes(R.color.dsh_accent_soft))
+        }
+        val (label, color, bg) = t
+        text = label
+        textSize = 11f
+        setTextColor(color)
+        background = roundRect(bg, 99, 0)
+        setPadding(dp(8), dp(3), dp(8), dp(3))
+        setTypeface(typeface, android.graphics.Typeface.BOLD)
+    }
+
+    /** 删除前二次确认（需求：删除计划需二次确认）。 */
+    private fun confirmDeleteReminder(r: Reminder) {
+        val ctx = this@SettingsActivity
+        val tf = android.graphics.Typeface.DEFAULT
+        // ---- 自定义卡片 Dialog：与「新建提醒」统一 UI（圆角卡片 + 色板色 + 自绘按钮栏）----
+        val card = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            background = roundRect(colorRes(R.color.dsh_bg_card), 24, 0)
+            setPadding(dp(4), dp(4), dp(4), dp(4))
+        }
+        // 标题栏
+        val titleBar = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+            setPadding(dp(16), dp(16), dp(12), dp(6))
+        }
+        titleBar.addView(TextView(ctx).apply {
+            text = "删除提醒"
+            textSize = 17f
+            setTextColor(colorRes(R.color.dsh_text_primary))
+            setTypeface(tf, android.graphics.Typeface.BOLD)
+        }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val closeX = TextView(ctx).apply {
+            text = "✕"
+            textSize = 16f
+            gravity = Gravity.CENTER
+            setTextColor(colorRes(R.color.dsh_text_hint))
+            setPadding(dp(8), dp(8), dp(8), dp(8))
+        }
+        titleBar.addView(closeX)
+        card.addView(titleBar)
+        // 内容区
+        val body = LinearLayout(ctx).apply {
+            orientation = LinearLayout.VERTICAL
+            setPadding(dp(20), dp(6), dp(20), dp(10))
+        }
+        body.addView(TextView(ctx).apply {
+            text = "确定删除「${r.title}」？"
+            textSize = 16f
+            setTextColor(colorRes(R.color.dsh_text_primary))
+            setTypeface(tf, android.graphics.Typeface.BOLD)
+        })
+        body.addView(TextView(ctx).apply {
+            text = "删除后无法恢复。"
+            textSize = 13.5f
+            setTextColor(colorRes(R.color.dsh_text_hint))
+            setPadding(0, dp(6), 0, 0)
+        })
+        card.addView(body)
+        // 按钮栏：取消 / 删除（危险色主按钮）
+        val btnRow = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            setPadding(dp(16), dp(10), dp(16), dp(16))
+        }
+        val cancelBtn = pill("取消", false) { }
+        val deleteBtn = Button(ctx).apply {
+            text = "删除"
+            textSize = 13.5f
+            isAllCaps = false
+            setTextColor(Color.WHITE)
+            background = roundRect(colorRes(R.color.dsh_danger), 14, 0)
+            stateListAnimator = null
+            minHeight = 0
+            minimumHeight = 0
+            setPadding(dp(6), dp(10), dp(6), dp(10))
+        }
+        btnRow.addView(cancelBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        btnRow.addView(deleteBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f).apply { leftMargin = dp(10) })
+        card.addView(btnRow)
+        // 组装 Dialog
+        val dlg = android.app.Dialog(ctx)
+        dlg.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+        dlg.setContentView(card, LinearLayout.LayoutParams(
+            (ctx.resources.displayMetrics.widthPixels * 0.9).toInt(),
+            ViewGroup.LayoutParams.WRAP_CONTENT,
+        ))
+        dlg.window?.setLayout(
+            (ctx.resources.displayMetrics.widthPixels * 0.9).toInt(),
+            ViewGroup.LayoutParams.WRAP_CONTENT
+        )
+        dlg.window?.setBackgroundDrawable(ColorDrawable(0x00000000.toInt()))
+        closeX.setOnClickListener { dlg.dismiss() }
+        cancelBtn.setOnClickListener { dlg.dismiss() }
+        deleteBtn.setOnClickListener {
+            dlg.dismiss()
+            deleteWithUndo(r)
+        }
+        dlg.show()
+    }
+
+    /** 定位并高亮某条提醒（气泡/通知点击跳来用）：滚动到该项 + 蓝框闪一下。
+     *  列表已按 timeMs 升序，focus 的 id 在列表中的序号 = indexOfFirst { it.id == id }。 */
+    private fun focusReminderItem(id: String) {
+        val list = Reminder.load(Store.readReminders(this))
+        val idx = list.indexOfFirst { it.id == id }
+        if (idx < 0 || idx >= reminderListContainer.childCount) return
+        val tv = reminderListContainer.getChildAt(idx)
+        reminderTabScroll.smoothScrollTo(0, (tv.top - dp(16)).coerceAtLeast(0))
+        val orig = tv.background
+        tv.background = roundRect(colorRes(R.color.dsh_focus_highlight), 20, colorRes(R.color.dsh_accent))
+        main.postDelayed({ tv.background = orig }, 1600L)
+    }
+/**
+ * 新增提醒/计划对话框（自定义 Dialog，统一 UI 风格：卡片圆角 + 色板色 + 自绘标题栏/按钮栏，
+ * 替代原生 AlertDialog 的默认外观）。步骤区用固定高度宿主，备忘/计划两种模式尺寸一致。
+ * 漏填时保持弹窗不关闭（不丢已填内容）。
+ */
+private fun showAddReminderDialog() {
+    val ctx = this@SettingsActivity
+    val isPlan = java.util.concurrent.atomic.AtomicBoolean(false)
+    fun paintTypeBtn(b: Button, active: Boolean) {
+        b.setTextColor(if (active) Color.WHITE else colorRes(R.color.dsh_text_secondary))
+        b.background = roundRect(
+            if (active) colorRes(R.color.dsh_accent) else colorRes(R.color.dsh_accent_soft),
+            14, if (active) 0 else colorRes(R.color.dsh_accent_stroke))
+    }
+    val memoBtn = pill("备忘", true) {}
+    val planBtn = pill("计划（多步骤）", false) {}
+    val typeRow = LinearLayout(ctx).apply {
+        orientation = LinearLayout.HORIZONTAL
+        setPadding(0, 0, 0, dp(12))
+        addView(memoBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        addView(planBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            .apply { leftMargin = dp(8) })
+    }
+    val titleEdit = input("标题", "比如：喝水 / 交房租")
+    val tagsEdit = input("标签", "用逗号分隔，如：工作,生活（可空）")
+    val timeWheel = TimeWheelView(ctx).apply {
+        layoutParams = LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, dp(220),
+        )
+    }
+    val wheelHost = LinearLayout(ctx).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(0, dp(6), 0, dp(4))
+        addView(desc("年 / 月 / 日 / 时 / 分 / 秒（滚动选择，松手自动吸附）"))
+        addView(timeWheel)
+    }
+    // 步骤区：固定高度宿主，备忘显占位、计划显输入框+加号（两模式尺寸一致）
+    val stepHost = LinearLayout(ctx).apply {
+        orientation = LinearLayout.VERTICAL
+    }
+    val stepsContainer = LinearLayout(ctx).apply {
+        orientation = LinearLayout.VERTICAL
+    }
+    // 步骤列表 = 弹窗内「唯一」的滚动区（固定可滚高度 maxStepH，超了就内部滚，不整页滚）
+    val maxStepH = dp(150)
+    val stepsScroll = android.widget.ScrollView(ctx).apply {
+        isVerticalScrollBarEnabled = true
+        addView(stepsContainer, android.view.ViewGroup.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+        visibility = View.GONE
+    }
+    val stepPlaceholder = TextView(ctx).apply {
+        text = "备忘不需要步骤；切换「计划」可添加多个步骤"
+        textSize = 12.5f
+        setTextColor(colorRes(R.color.dsh_text_faint))
+        gravity = Gravity.CENTER
+        setPadding(dp(8), dp(10), dp(8), dp(10))
+        background = roundRect(colorRes(R.color.dsh_input_bg), 12, colorRes(R.color.dsh_accent_stroke))
+        visibility = View.VISIBLE
+    }
+    val stepRows = ArrayList<EditText>()
+    fun addStepRow() {
+        val row = LinearLayout(ctx).apply {
+            orientation = LinearLayout.HORIZONTAL
+            gravity = Gravity.CENTER_VERTICAL
+        }
+        val et = EditText(ctx).apply {
+            hint = "步骤内容"
+            textSize = 14f
+            setTextColor(colorRes(R.color.dsh_text_input))
+            background = roundRect(colorRes(R.color.dsh_input_bg), 12, colorRes(R.color.dsh_accent_stroke))
+            setPadding(dp(12), dp(8), dp(12), dp(8))
+            setSingleLine(true)
+        }
+        row.addView(et, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        val del = TextView(ctx).apply {
+            text = "✕"
+            textSize = 17f
+            setTextColor(colorRes(R.color.dsh_danger))
+            setPadding(dp(10), 0, dp(2), 0)
+        }
+        del.setOnClickListener {
+            stepsContainer.removeView(row)
+            stepRows.remove(et)
+        }
+        row.addView(del)
+        stepsContainer.addView(row, LinearLayout.LayoutParams(
+            ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+        ).apply { topMargin = dp(6) })
+        stepRows.add(et)
+    }
+    val addStepBtn = pill("＋ 添加步骤", false) { addStepRow() }
+    addStepBtn.visibility = View.GONE
+    // 固定高度宿主：占位（备忘）/ 步骤区（计划）叠放，尺寸恒定
+    val stepArea = LinearLayout(ctx).apply {
+        orientation = LinearLayout.VERTICAL
+    }
+    stepArea.addView(stepPlaceholder, LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+    // 步骤区放进 stepsScroll（固定高度 maxStepH，多步骤就内部滚；整页不再滚）
+    stepArea.addView(stepsScroll, LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT, maxStepH))
+    stepArea.addView(addStepBtn, LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+    ).apply { topMargin = dp(8) })
+    stepHost.addView(desc("步骤"))
+    stepHost.addView(stepArea)
+    // 类型切换
+    memoBtn.setOnClickListener {
+        isPlan.set(false); paintTypeBtn(memoBtn, true); paintTypeBtn(planBtn, false)
+        stepPlaceholder.visibility = View.VISIBLE
+        stepsScroll.visibility = View.GONE
+        addStepBtn.visibility = View.GONE
+    }
+    planBtn.setOnClickListener {
+        isPlan.set(true); paintTypeBtn(memoBtn, false); paintTypeBtn(planBtn, true)
+        stepPlaceholder.visibility = View.GONE
+        stepsScroll.visibility = View.VISIBLE
+        addStepBtn.visibility = View.VISIBLE
+        if (stepRows.isEmpty()) addStepRow()
+    }
+    val body = LinearLayout(ctx).apply {
+        orientation = LinearLayout.VERTICAL
+        setPadding(dp(20), dp(16), dp(20), dp(12))
+    }
+    // ---- 重复规则 / 提前提醒：两个 chip，点开单选弹窗，纵向只占一行（不给弹窗添高）----
+    val repeatVals = listOf(
+        Reminder.REPEAT_NONE, Reminder.REPEAT_DAILY, Reminder.REPEAT_WEEKLY,
+        Reminder.REPEAT_WEEKDAYS, Reminder.REPEAT_MONTHLY,
+    )
+    val repeatTexts = repeatVals.map { Reminder.repeatLabel(it) }
+    val advVals = listOf(0, 5, 15, 30, 60)
+    val advTexts = listOf("准时", "提前 5 分钟", "提前 15 分钟", "提前 30 分钟", "提前 1 小时")
+    var selRepeat = Reminder.REPEAT_NONE
+    var selAdvMin = 0
+    var repeatChip: Button? = null
+    var advChip: Button? = null
+    repeatChip = pill("重复：不重复", false) {
+        showChoiceDialog("重复", repeatTexts, repeatVals.indexOf(selRepeat)) { i ->
+            selRepeat = repeatVals[i]
+            repeatChip?.text = "重复：${repeatTexts[i]}"
+        }
+    }
+    advChip = pill("提前：准时", false) {
+        showChoiceDialog("提前提醒", advTexts, advVals.indexOf(selAdvMin)) { i ->
+            selAdvMin = advVals[i]
+            advChip?.text = "提前：${advTexts[i]}"
+        }
+    }
+    val optRow = LinearLayout(ctx).apply {
+        orientation = LinearLayout.HORIZONTAL
+        setPadding(0, 0, 0, dp(10))
+        addView(repeatChip, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+        addView(advChip, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+            .apply { leftMargin = dp(8) })
+    }
+    body.addView(typeRow)
+    body.addView(titleEdit)
+    body.addView(tagsEdit)
+    body.addView(optRow)
+    body.addView(wheelHost)
+    body.addView(stepHost)
+
+    // ---- 自定义 Dialog：卡片圆角 + 色板色 + 自绘标题栏/按钮栏，统一 UI 风格 ----
+    val card = LinearLayout(ctx).apply {
+        orientation = LinearLayout.VERTICAL
+        background = roundRect(colorRes(R.color.dsh_bg_card), 24, 0)
+        setPadding(dp(4), dp(4), dp(4), dp(4))
+    }
+    // 标题栏（标题 + 右上关闭）
+    val titleBar = LinearLayout(ctx).apply {
+        orientation = LinearLayout.HORIZONTAL
+        gravity = Gravity.CENTER_VERTICAL
+        setPadding(dp(16), dp(16), dp(12), dp(6))
+    }
+    titleBar.addView(TextView(ctx).apply {
+        text = "新建提醒 / 计划"
+        textSize = 17f
+        setTextColor(colorRes(R.color.dsh_text_primary))
+        setTypeface(typeface, android.graphics.Typeface.BOLD)
+    }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+    val closeX = TextView(ctx).apply {
+        text = "✕"
+        textSize = 16f
+        gravity = Gravity.CENTER
+        setTextColor(colorRes(R.color.dsh_text_hint))
+        setPadding(dp(8), dp(8), dp(8), dp(8))
+    }
+    titleBar.addView(closeX)
+    card.addView(titleBar)
+    // 内容：body 直接入卡片（不再整页滚）——步骤列表自带 150dp 局部滚动区（stepsScroll），
+    // 多步骤时在步骤区内部滚，标题/滚轮/按钮始终可见，弹窗高度贴合内容、无下半空白。
+    card.addView(body, LinearLayout.LayoutParams(
+        ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT))
+    // 按钮栏：取消 / 保存（先建按钮，点击绑定在 dlg 声明后统一做）
+    val btnRow = LinearLayout(ctx).apply {
+        orientation = LinearLayout.HORIZONTAL
+        setPadding(dp(20), dp(10), dp(20), dp(16))
+    }
+    val cancelBtn = pill("取消", false) { }
+    val saveBtn = pill("保存", true) { }
+    btnRow.addView(cancelBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+    btnRow.addView(saveBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f)
+        .apply { leftMargin = dp(12) })
+    card.addView(btnRow)
+    // 组装 Dialog：card 高度自适应（WRAP_CONTENT）——步骤区自带 150dp 局部滚动，整页不滚、无下半空白
+    val dlg = android.app.Dialog(ctx)
+    dlg.requestWindowFeature(android.view.Window.FEATURE_NO_TITLE)
+    dlg.setContentView(card, LinearLayout.LayoutParams(
+        (ctx.resources.displayMetrics.widthPixels * 0.9).toInt(),
+        ViewGroup.LayoutParams.WRAP_CONTENT,
+    ))
+    dlg.window?.setLayout(
+        (ctx.resources.displayMetrics.widthPixels * 0.9).toInt(),
+        ViewGroup.LayoutParams.WRAP_CONTENT
+    )
+    dlg.window?.setBackgroundDrawable(ColorDrawable(0x00000000.toInt()))
+    // 点击绑定（此时 dlg 已声明，可安全引用；漏填不关弹窗，仅合法保存才 dismiss）
+    closeX.setOnClickListener { dlg.dismiss() }
+    cancelBtn.setOnClickListener { dlg.dismiss() }
+    saveBtn.setOnClickListener {
+        val title = titleEdit.text.toString().trim()
+        if (title.isEmpty()) {
+            Toast.makeText(ctx, "请填写标题", Toast.LENGTH_SHORT).show()
+            titleEdit.requestFocus()
+            return@setOnClickListener
+        }
+        val timeMs = timeWheel.picked().toEpochMilli()
+        val status = if (timeMs <= System.currentTimeMillis())
+            Reminder.STATUS_TRIGGERED else Reminder.STATUS_PENDING
+        if (isPlan.get()) {
+            val steps = stepRows.map { Reminder.Step(it.text.toString().trim(), false) }
+                .filter { it.text.isNotEmpty() }
+            if (steps.isEmpty()) {
+                Toast.makeText(ctx, "计划至少填一个步骤", Toast.LENGTH_SHORT).show()
+                return@setOnClickListener
+            }
+            addReminder(Reminder.Plan("r_${System.nanoTime()}", title, timeMs, status, steps = steps,
+                repeat = selRepeat, advanceMin = selAdvMin,
+                tags = Reminder.parseTags(tagsEdit.text.toString())))
+        } else {
+            addReminder(Reminder.Memo("r_${System.nanoTime()}", title, timeMs, status,
+                repeat = selRepeat, advanceMin = selAdvMin,
+                tags = Reminder.parseTags(tagsEdit.text.toString())))
+        }
+        dlg.dismiss()
+    }
+    dlg.show()
+}
+/** 落盘一条新提醒 + 刷新 + 挂闹钟。 */
+private fun addReminder(r: Reminder) {
+    val list = Reminder.load(Store.readReminders(this)).toMutableList()
+    list.add(r)
+    Store.writeReminders(this, Reminder.save(list))
+    ReminderScheduler.armAll(this)
+    refreshReminderList()
+    Toast.makeText(this, "已添加「${r.title}」", Toast.LENGTH_SHORT).show()
+}
 
     /** 卡片容器：白底圆角 + 轻阴影，块内直接 addView 即可 */
     private fun card(block: LinearLayout.() -> Unit): LinearLayout {
         val c = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(16), dp(16), dp(16), dp(16))
-            background = roundRect(0xFFFFFFFF.toInt(), 20, 0)
+            background = roundRect(colorRes(R.color.dsh_bg_card), 20, 0)
             elevation = dp(2).toFloat()
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-            ).apply { topMargin = dp(14) }
+            ).apply { topMargin = dp(12) }
         }
         c.block()
         return c
@@ -560,7 +2381,7 @@ class SettingsActivity : AppCompatActivity() {
         val root = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(20), 0, dp(20), dp(16))
-            background = roundRect(0xFFFFFFFF.toInt(), 20, 0)
+            background = roundRect(colorRes(R.color.dsh_bg_card), 20, 0)
         }
         // 标题栏
         val titleRow = LinearLayout(this).apply {
@@ -577,13 +2398,13 @@ class SettingsActivity : AppCompatActivity() {
         val subtitle = TextView(this).apply {
             text = "共 $entries 条记录"
             textSize = 12f
-            setTextColor(0xFF7A839A.toInt())
+            setTextColor(colorRes(R.color.dsh_text_hint))
         }
         titleRow.addView(subtitle, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         root.addView(titleRow)
         // 分隔线（用 marginTop 控制间距，避免 setMargins 四参易错）
         val divider = View(this).apply {
-            setBackgroundColor(0xFFE8ECF4.toInt())
+            setBackgroundColor(colorRes(R.color.dsh_divider))
             layoutParams = LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, dp(1),
             ).apply { topMargin = dp(10) }
@@ -600,9 +2421,9 @@ class SettingsActivity : AppCompatActivity() {
         scroll.addView(TextView(this).apply {
             text = txt
             textSize = 11f
-            setTextColor(0xFF1F2637.toInt())
+            setTextColor(colorRes(R.color.dsh_text_input))
             typeface = android.graphics.Typeface.MONOSPACE
-            background = roundRect(0xFFF7F9FD.toInt(), 12, 0xFFDCE2EF.toInt())
+            background = roundRect(colorRes(R.color.dsh_input_bg), 12, colorRes(R.color.dsh_accent_stroke))
             setPadding(dp(10), dp(8), dp(10), dp(8))
         })
         root.addView(scroll)
@@ -654,21 +2475,23 @@ class SettingsActivity : AppCompatActivity() {
         text = t
         textSize = 13f
         setTypeface(typeface, android.graphics.Typeface.BOLD)
-        setTextColor(0xFF5B6B8C.toInt())
+        setTextColor(colorRes(R.color.dsh_section_title))
         letterSpacing = 0.06f
-        setPadding(0, 0, 0, dp(6))
+        includeFontPadding = false
+        setPadding(0, 0, 0, dp(8))
     }
 
     private fun desc(t: String) = TextView(this).apply {
         text = t
         textSize = 12.5f
-        setTextColor(0xFF7A839A.toInt())
-        setPadding(0, 0, 0, dp(6))
+        setLineSpacing(dp(2).toFloat(), 1f)
+        setTextColor(colorRes(R.color.dsh_text_hint))
+        setPadding(0, 0, 0, dp(8))
     }
 
     private fun valueLabel() = TextView(this).apply {
         textSize = 13f
-        setTextColor(0xFF3B6FD6.toInt())
+        setTextColor(colorRes(R.color.dsh_accent))
         setTypeface(typeface, android.graphics.Typeface.BOLD)
     }
 
@@ -680,7 +2503,7 @@ class SettingsActivity : AppCompatActivity() {
             TextView(this@SettingsActivity).apply {
                 text = label
                 textSize = 14f
-                setTextColor(0xFF2A3244.toInt())
+                setTextColor(colorRes(R.color.dsh_text_secondary))
             },
             LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f),
         )
@@ -703,30 +2526,40 @@ class SettingsActivity : AppCompatActivity() {
         })
     }
 
+    // 控件尺寸令牌：所有胶囊按钮 / tab / 次级动作统一到同一高度与圆角，避免行间参差
+    private val PILL_H = 40
+    private val PILL_RADIUS = 14
+
     private fun pill(text: String, primary: Boolean, onClick: () -> Unit) = Button(this).apply {
         this.text = text
         textSize = 13.5f
         isAllCaps = false
-        setTextColor(if (primary) Color.WHITE else 0xFF2A3244.toInt())
+        gravity = Gravity.CENTER
+        includeFontPadding = false
+        setTextColor(if (primary) Color.WHITE else colorRes(R.color.dsh_text_secondary))
         background = roundRect(
-            if (primary) 0xFF3B6FD6.toInt() else 0xFFEDF1F9.toInt(),
-            14,
-            if (primary) 0 else 0xFFDCE2EF.toInt(),
+            if (primary) colorRes(R.color.dsh_accent) else colorRes(R.color.dsh_accent_soft),
+            PILL_RADIUS,
+            if (primary) 0 else colorRes(R.color.dsh_accent_stroke),
         )
         stateListAnimator = null
-        minHeight = 0
-        minimumHeight = 0
-        setPadding(dp(6), dp(10), dp(6), dp(10))
+        // 用 minHeight 而不是 layoutParams 固定高度：调用方传 WRAP_CONTENT 也能拿到 40dp，
+        // 传 weight/0 时也不会被覆盖（曾因写死 layoutParams 导致带权重的按钮行塔成文字高）。
+        minHeight = dp(PILL_H)
+        minimumHeight = dp(PILL_H)
+        minWidth = 0
+        minimumWidth = 0
+        setPadding(dp(14), 0, dp(14), 0)
         setOnClickListener { onClick() }
     }
 
     private fun input(label: String, sample: String) = EditText(this).apply {
         hint = "$label（如 $sample）"
-        setHintTextColor(0xFFAEB6C6.toInt())
-        setTextColor(0xFF1F2637.toInt())
+        setHintTextColor(colorRes(R.color.dsh_text_input_hint))
+        setTextColor(colorRes(R.color.dsh_text_input))
         textSize = 14f
         setSingleLine(true)
-        background = roundRect(0xFFF7F9FD.toInt(), 12, 0xFFDCE2EF.toInt())
+        background = roundRect(colorRes(R.color.dsh_input_bg), 12, colorRes(R.color.dsh_accent_stroke))
         setPadding(dp(12), dp(10), dp(12), dp(10))
         layoutParams = LinearLayout.LayoutParams(
             ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
@@ -760,10 +2593,10 @@ class SettingsActivity : AppCompatActivity() {
         }
         statusDot.background = roundRect(
             when {
-                !overlay -> 0xFFE05A5A.toInt()
-                !running -> 0xFFB9C0D0.toInt()
-                hidden -> 0xFFF0B429.toInt()
-                else -> 0xFF34C759.toInt()
+                !overlay -> colorRes(R.color.dsh_status_stop)
+                !running -> colorRes(R.color.dsh_dot_inactive)
+                hidden -> colorRes(R.color.dsh_status_hidden)
+                else -> colorRes(R.color.dsh_status_run)
             },
             99,
             0,
@@ -773,12 +2606,12 @@ class SettingsActivity : AppCompatActivity() {
         // 运行中=红色「停止桌宠」，停止时=蓝色「启动桌宠」，没权限=灰色不可点。
         powerBtn.isEnabled = overlay
         powerBtn.text = if (running) "停止桌宠" else "启动桌宠"
-        powerBtn.setTextColor(if (overlay) Color.WHITE else 0xFF9AA3B5.toInt())
+        powerBtn.setTextColor(if (overlay) Color.WHITE else colorRes(R.color.dsh_text_faint))
         powerBtn.background = roundRect(
             when {
-                !overlay -> 0xFFE4E8F1.toInt()
-                running -> 0xFFE05A5A.toInt()
-                else -> 0xFF3B6FD6.toInt()
+                !overlay -> colorRes(R.color.dsh_status_disabled)
+                running -> colorRes(R.color.dsh_status_stop)
+                else -> colorRes(R.color.dsh_accent)
             },
             14,
             0,
@@ -839,11 +2672,11 @@ class SettingsActivity : AppCompatActivity() {
         btn.isEnabled = true
         btn.text = if (granted) "$label ·已授权" else "$label ·未授权"
         btn.textSize = 12f
-        btn.setTextColor(if (granted) 0xFF2E7D4F.toInt() else 0xFFC53030.toInt())
+        btn.setTextColor(if (granted) colorRes(R.color.dsh_success) else colorRes(R.color.dsh_danger))
         btn.background = roundRect(
-            if (granted) 0xFFE8F7EE.toInt() else 0xFFFDECEC.toInt(),
+            if (granted) colorRes(R.color.dsh_success_bg) else colorRes(R.color.dsh_perm_deny_bg),
             14,
-            if (granted) 0xFF9BD9B4.toInt() else 0xFFF3B4B4.toInt(),
+            if (granted) colorRes(R.color.dsh_perm_grant_stroke) else colorRes(R.color.dsh_perm_deny_stroke),
         )
     }
 
@@ -920,6 +2753,57 @@ class SettingsActivity : AppCompatActivity() {
             startActivity(Intent(Settings.ACTION_APPLICATION_DETAILS_SETTINGS, Uri.parse("package:$packageName")))
         } catch (e: Exception) {
             Toast.makeText(this, "无法打开通知设置，请到系统设置里手动授予", Toast.LENGTH_LONG).show()
+        }
+    }
+
+    override fun onActivityResult(requestCode: Int, resultCode: Int, data: Intent?) {
+        super.onActivityResult(requestCode, resultCode, data)
+        if (resultCode != RESULT_OK) return
+        val uri = data?.data ?: return
+        when (requestCode) {
+            REQ_EXPORT_REMINDERS -> {
+                try {
+                    val json = Store.readReminders(this)
+                    contentResolver.openOutputStream(uri)?.use { it.write(json.toByteArray(Charsets.UTF_8)) }
+                    Toast.makeText(this, "已导出提醒", Toast.LENGTH_SHORT).show()
+                } catch (e: Exception) {
+                    Toast.makeText(this, "导出失败：${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
+            REQ_EXPORT_TEXT -> {
+                try {
+                    contentResolver.openOutputStream(uri)?.use {
+                        it.write(pendingExportText.toByteArray(Charsets.UTF_8))
+                    }
+                    Toast.makeText(this, "已导出", Toast.LENGTH_SHORT).show()
+                } catch (e: Exception) {
+                    Toast.makeText(this, "导出失败：${e.message}", Toast.LENGTH_LONG).show()
+                }
+                pendingExportText = ""
+            }
+            REQ_IMPORT_REMINDERS -> {
+                try {
+                    val text = contentResolver.openInputStream(uri)?.use {
+                        it.readBytes().toString(Charsets.UTF_8)
+                    } ?: ""
+                    val incoming = Reminder.load(text)
+                    if (incoming.isEmpty()) {
+                        Toast.makeText(this, "文件里没有可导入的提醒", Toast.LENGTH_SHORT).show()
+                        return
+                    }
+                    // 合并去重：同 id 保留本地，新 id 追加
+                    val local = Reminder.load(Store.readReminders(this)).toMutableList()
+                    val ids = local.map { it.id }.toHashSet()
+                    var added = 0
+                    for (r in incoming) if (ids.add(r.id)) { local.add(r); added++ }
+                    Store.writeReminders(this, Reminder.save(local))
+                    ReminderScheduler.armAll(this)
+                    refreshReminderList()
+                    Toast.makeText(this, "已导入 $added 条提醒", Toast.LENGTH_SHORT).show()
+                } catch (e: Exception) {
+                    Toast.makeText(this, "导入失败：${e.message}", Toast.LENGTH_LONG).show()
+                }
+            }
         }
     }
 
@@ -1157,7 +3041,7 @@ class SettingsActivity : AppCompatActivity() {
         }
         PetService.instance?.reloadConfig()
         val missing = obj.optString("baseUrl").isEmpty() || obj.optString("model").isEmpty()
-        aiHint.setTextColor(if (missing) 0xFFB07A00.toInt() else 0xFF3B7A57.toInt())
+        aiHint.setTextColor(if (missing) 0xFFB07A00.toInt() else colorRes(R.color.dsh_success))
         aiHint.text = if (missing) {
             "已保存。还差接口地址或模型名，填完才能对话。"
         } else {
@@ -1184,7 +3068,7 @@ class SettingsActivity : AppCompatActivity() {
             updateBtn.text = "检查中…"
         }
         if (::updateHint.isInitialized) {
-            updateHint.setTextColor(0xFF7A839A.toInt())
+            updateHint.setTextColor(colorRes(R.color.dsh_text_hint))
             updateHint.text = "正在查询 GitHub…"
         }
         UpdateChecker.check(this) { result, error ->
@@ -1207,12 +3091,12 @@ class SettingsActivity : AppCompatActivity() {
                     updateHint.text = "检查失败：没有拿到有效返回"
                 }
                 r.newer -> {
-                    updateHint.setTextColor(0xFF3B6FD6.toInt())
+                    updateHint.setTextColor(colorRes(R.color.dsh_accent))
                     updateHint.text = "发现新版本 ${r.tag}（当前 $current）"
                     showUpdateDialog(r, current)
                 }
                 else -> {
-                    updateHint.setTextColor(0xFF3B7A57.toInt())
+                    updateHint.setTextColor(colorRes(R.color.dsh_success))
                     updateHint.text = "已是最新版本（$current）· 最新发布 ${r.tag}"
                     if (!silent) Toast.makeText(this, "已是最新版本", Toast.LENGTH_SHORT).show()
                 }
@@ -1238,7 +3122,7 @@ class SettingsActivity : AppCompatActivity() {
         val card = LinearLayout(this).apply {
             orientation = LinearLayout.VERTICAL
             setPadding(dp(22), dp(20), dp(22), dp(20))
-            background = roundRect(0xFFFFFFFF.toInt(), 22, 0)
+            background = roundRect(colorRes(R.color.dsh_bg_card), 22, 0)
         }
 
         // NEW 标签 + 标题
@@ -1248,7 +3132,7 @@ class SettingsActivity : AppCompatActivity() {
             setTypeface(typeface, Typeface.BOLD)
             setTextColor(Color.WHITE)
             gravity = Gravity.CENTER
-            background = roundRect(0xFF3B6FD6.toInt(), 9, 0)
+            background = roundRect(colorRes(R.color.dsh_accent), 9, 0)
             setPadding(dp(9), dp(4), dp(9), dp(4))
         }
         val titleRow = LinearLayout(this).apply {
@@ -1262,7 +3146,7 @@ class SettingsActivity : AppCompatActivity() {
             text = "发现新版本"
             textSize = 18f
             setTypeface(typeface, Typeface.BOLD)
-            setTextColor(0xFF141A2B.toInt())
+            setTextColor(colorRes(R.color.dsh_text_primary))
         }, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
         card.addView(titleRow)
 
@@ -1272,16 +3156,16 @@ class SettingsActivity : AppCompatActivity() {
             gravity = Gravity.CENTER_VERTICAL
             setPadding(0, dp(12), 0, 0)
         }
-        verRow.addView(versionPill(current, 0xFFB9C0D0.toInt(), 0xFFEDF1F9.toInt()),
+        verRow.addView(versionPill(current, colorRes(R.color.dsh_dot_inactive), colorRes(R.color.dsh_accent_soft)),
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         verRow.addView(TextView(this).apply {
             text = "→"
             textSize = 16f
-            setTextColor(0xFF3B6FD6.toInt())
+            setTextColor(colorRes(R.color.dsh_accent))
             setTypeface(typeface, Typeface.BOLD)
             setPadding(dp(10), 0, dp(10), 0)
         })
-        verRow.addView(versionPill(r.tag, 0xFF3B6FD6.toInt(), 0xFFE3ECFF.toInt()),
+        verRow.addView(versionPill(r.tag, colorRes(R.color.dsh_accent), colorRes(R.color.dsh_focus_highlight)),
             LinearLayout.LayoutParams(ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT))
         card.addView(verRow)
 
@@ -1291,14 +3175,14 @@ class SettingsActivity : AppCompatActivity() {
                 text = "更新日志"
                 textSize = 12f
                 setTypeface(typeface, Typeface.BOLD)
-                setTextColor(0xFF5B6B8C.toInt())
+                setTextColor(colorRes(R.color.dsh_section_title))
                 setPadding(0, dp(16), 0, dp(4))
             })
             val logScroll = ScrollView(this).apply {
                 isVerticalScrollBarEnabled = true
-                setBackgroundColor(0xFFF7F9FD.toInt())
+                setBackgroundColor(colorRes(R.color.dsh_input_bg))
                 setPadding(dp(12), dp(8), dp(12), dp(8))
-                background = roundRect(0xFFF7F9FD.toInt(), 12, 0xFFE8ECF4.toInt())
+                background = roundRect(colorRes(R.color.dsh_input_bg), 12, colorRes(R.color.dsh_divider))
                 layoutParams = LinearLayout.LayoutParams(
                     ViewGroup.LayoutParams.MATCH_PARENT, dp(140),
                 )
@@ -1317,7 +3201,7 @@ class SettingsActivity : AppCompatActivity() {
             text = "选择更新方式"
             textSize = 12f
             setTypeface(typeface, Typeface.BOLD)
-            setTextColor(0xFF5B6B8C.toInt())
+            setTextColor(colorRes(R.color.dsh_section_title))
             setPadding(0, dp(16), 0, dp(8))
         })
 
@@ -1358,7 +3242,7 @@ class SettingsActivity : AppCompatActivity() {
         card.addView(progress)
         val progressLabel = TextView(this).apply {
             textSize = 12f
-            setTextColor(0xFF3B6FD6.toInt())
+            setTextColor(colorRes(R.color.dsh_accent))
             isVisible = false
             setPadding(0, dp(4), 0, 0)
             gravity = Gravity.CENTER
@@ -1433,11 +3317,11 @@ class SettingsActivity : AppCompatActivity() {
             val existing = UpdateInstaller.findCompleted(this, apk)
             if (existing != null) {
                 progress.progress = 100
-                progressLabel.setTextColor(0xFF3B7A57.toInt())
+                progressLabel.setTextColor(colorRes(R.color.dsh_success))
                 progressLabel.text = "本地已有完整包，直接安装…"
                 main.post { UpdateInstaller.install(this, existing) }
             } else {
-                progressLabel.setTextColor(0xFF3B6FD6.toInt())
+                progressLabel.setTextColor(colorRes(R.color.dsh_accent))
                 progressLabel.text = "正在下载… 0%"
                 UpdateInstaller.downloadAndInstall(
                     this, apk,
@@ -1465,7 +3349,7 @@ class SettingsActivity : AppCompatActivity() {
                         }
                         // 成功：file 在盘上
                         progressLabel.isVisible = true
-                        progressLabel.setTextColor(0xFF3B7A57.toInt())
+                        progressLabel.setTextColor(colorRes(R.color.dsh_success))
                         progressLabel.text = "已下载，按系统提示安装即可（若被要求授权，回来点下方再装一次）"
                         // 文件仍在盘 → 允许"授权回来后直接再装一次"
                         downloadStarted = false
@@ -1509,9 +3393,9 @@ class SettingsActivity : AppCompatActivity() {
             orientation = LinearLayout.HORIZONTAL
             gravity = Gravity.CENTER_VERTICAL
             background = roundRect(
-                if (primary) 0xFF3B6FD6.toInt() else 0xFFEDF1F9.toInt(),
+                if (primary) colorRes(R.color.dsh_accent) else colorRes(R.color.dsh_accent_soft),
                 14,
-                if (primary) 0 else 0xFFDCE2EF.toInt(),
+                if (primary) 0 else colorRes(R.color.dsh_accent_stroke),
             )
             setPadding(dp(14), dp(12), dp(14), dp(12))
         }
@@ -1523,18 +3407,18 @@ class SettingsActivity : AppCompatActivity() {
             text = title
             textSize = 14.5f
             setTypeface(typeface, Typeface.BOLD)
-            setTextColor(if (primary) Color.WHITE else 0xFF2A3244.toInt())
+            setTextColor(if (primary) Color.WHITE else colorRes(R.color.dsh_text_secondary))
         })
         textCol.addView(TextView(this).apply {
             text = sub
             textSize = 11.5f
-            setTextColor(if (primary) 0xCcFFFFFF.toInt() else 0xFF7A839A.toInt())
+            setTextColor(if (primary) 0xCcFFFFFF.toInt() else colorRes(R.color.dsh_text_hint))
         })
         container.addView(textCol)
         val chevron = TextView(this).apply {
             text = "›"
             textSize = 24f
-            setTextColor(if (primary) Color.WHITE else 0xFF3B6FD6.toInt())
+            setTextColor(if (primary) Color.WHITE else colorRes(R.color.dsh_accent))
         }
         container.addView(chevron)
         return container
@@ -1568,29 +3452,29 @@ class SettingsActivity : AppCompatActivity() {
             setPadding(dp(20), dp(6), dp(20), 0)
         }
 
-        fun line(text: String, size: Float, color: Long, top: Int = 0): TextView =
+        fun line(text: String, size: Float, color: Int, top: Int = 0): TextView =
             TextView(this).apply {
                 this.text = text
                 textSize = size
-                setTextColor(color.toInt())
+                setTextColor(color)
                 setPadding(0, dp(top), 0, 0)
             }
 
-        fun heading(text: String, top: Int): TextView = line(text, 13f, 0xFF141A2B, top).apply {
+        fun heading(text: String, top: Int): TextView = line(text, 13f, colorRes(R.color.dsh_text_primary), top).apply {
             setTypeface(typeface, android.graphics.Typeface.BOLD)
         }
 
         // 本应用自身
-        body.addView(line("本应用：dsh-pet-android", 14f, 0xFF141A2B, 0).apply {
+        body.addView(line("本应用：dsh-pet-android", 14f, colorRes(R.color.dsh_text_primary), 0).apply {
             setTypeface(typeface, android.graphics.Typeface.BOLD)
         })
-        body.addView(line("MIT License · 点这里打开本仓库", 12.5f, 0xFF3B6FD6).apply {
+        body.addView(line("MIT License · 点这里打开本仓库", 12.5f, colorRes(R.color.dsh_accent)).apply {
             setOnClickListener { openUrl(UpdateChecker.repoUrl) }
         })
 
         // 一、直接基于
         body.addView(heading("一、直接基于（上游项目）", 14))
-        body.addView(line("界面渲染层、桌宠动画与素材都来自它，Android 侧只做平台桥接。", 12f, 0xFF7A839A, 2))
+        body.addView(line("界面渲染层、桌宠动画与素材都来自它，Android 侧只做平台桥接。", 12f, colorRes(R.color.dsh_text_hint), 2))
         addOssItem(
             body,
             "dsh-pet · PC2005-cloud",
@@ -1600,7 +3484,7 @@ class SettingsActivity : AppCompatActivity() {
 
         // 二、第三方依赖
         body.addView(heading("二、第三方依赖", 16))
-        body.addView(line("只调用公开 API，未修改其源码。", 12f, 0xFF7A839A, 2))
+        body.addView(line("只调用公开 API，未修改其源码。", 12f, colorRes(R.color.dsh_text_hint), 2))
         addOssItem(
             body,
             "AndroidX Core / AppCompat / Activity",
@@ -1638,14 +3522,14 @@ class SettingsActivity : AppCompatActivity() {
         parent.addView(TextView(this).apply {
             text = title
             textSize = 13.5f
-            setTextColor(0xFF3B6FD6.toInt())
+            setTextColor(colorRes(R.color.dsh_accent))
             setPadding(0, dp(10), 0, 0)
             setOnClickListener { openUrl(url) }
         })
         parent.addView(TextView(this).apply {
             text = desc
             textSize = 12f
-            setTextColor(0xFF7A839A.toInt())
+            setTextColor(colorRes(R.color.dsh_text_hint))
         })
     }
 }

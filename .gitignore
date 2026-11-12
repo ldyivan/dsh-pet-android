@@ -1,32 +1,19 @@
-# Gradle / Android 构建产物
-.gradle/
+# Gradle / 构建产物
 build/
-app/build/
+.gradle/
 local.properties
-captures/
-*.apk
-*.aab
-*.ap_
-*.dex
+*.iml
 
-# Kotlin
+# Kotlin / Android
 .kotlin/
 
-# IDE
-.idea/
-*.iml
-.vscode/
-*.hprof
+# 交付 APK（发布产物走 GitHub Releases，不进源码仓库）
+*.apk
 
-# Node / 渲染层产物
-node_modules/
-renderer/dist/
-renderer/package-lock.json
-
-# 系统文件
+# 系统 / 杂项
 .DS_Store
-Thumbs.db
+*.log
 
-# 开发备份文件（版本回退快照，不进仓库）
-*.bak_*
-*.bak_sleep
+# AndroidPE 工具自身元数据
+.androidpe/
+.backup/
