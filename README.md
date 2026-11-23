@@ -9,9 +9,9 @@
 
 把 [dsh-pet](https://github.com/PC2005-cloud/dsh-pet)（DSH 平台的桌面宠物插件）移植成独立 Android 应用：桌面上飘着一只会动、会说话、能拖拽的宠物。
 
-| 桌宠与长按菜单 | 设置页 |
-|---|---|
-| <img src="docs/screenshots/desktop.jpg" width="320"> | <img src="docs/screenshots/settings.jpg" width="320"> |
+| 桌宠与长按菜单 | 提醒与计划 | 设置页 |
+|---|---|---|
+| <img src="docs/screenshots/desktop.jpg" width="260"> | <img src="docs/screenshots/reminders.jpg" width="260"> | <img src="docs/screenshots/settings.jpg" width="260"> |
 
 ## 使用方法
 

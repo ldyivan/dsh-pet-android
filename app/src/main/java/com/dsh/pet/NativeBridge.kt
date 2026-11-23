@@ -164,6 +164,15 @@ class NativeBridge(private val svc: PetService) {
      */
     @JavascriptInterface
     fun reminderBubbleRect(json: String) = svc.applyReminderBubbleRect(json)
+    /**
+     * 说话气泡命中区上报（由 whisper-pop.js 调用）：json = {x,y,w,h}（视口归一化）
+     * 或 {active:false}（收回）。点按时 Kotlin 调 window.__dshPopWhisper() 播戳破动画。
+     */
+    @JavascriptInterface
+    fun whisperBubbleRect(json: String) = svc.applyWhisperBubbleRect(json)
+    /** 长按菜单「查询天气」：由 weather-menu.js 调用，异步取数后在宠物旁弹天气气泡。 */
+    @JavascriptInterface
+    fun weatherQuery() = svc.queryWeather()
 
     companion object {
         /**

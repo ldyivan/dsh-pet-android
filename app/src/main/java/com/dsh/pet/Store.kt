@@ -65,6 +65,23 @@ object Store {
         flags.optInt(key, def)
     } catch (e: Exception) { def }
 
+    /** 读字符串偏好（同样的 flags 存储）。 */
+    fun prefStr(ctx: Context, key: String, def: String): String = try {
+        val o = JSONObject(readUiSettings(ctx))
+        val flags = o.optJSONObject("flags") ?: return def
+        flags.optString(key, def)
+    } catch (e: Exception) { def }
+    /** 写字符串偏好。 */
+    fun prefSetStr(ctx: Context, key: String, value: String) {
+        try {
+            val o = try { JSONObject(readUiSettings(ctx)) } catch (e: Exception) { JSONObject() }
+            val flags = o.optJSONObject("flags") ?: JSONObject()
+            flags.put(key, value)
+            o.put("flags", flags)
+            writeUiSettings(ctx, o.toString())
+        } catch (_: Exception) { }
+    }
+
     /** 写整型偏好。 */
     fun prefSetInt(ctx: Context, key: String, value: Int) {
         try {

@@ -159,6 +159,12 @@ class PetService : Service() {
  *  点关闭按钮收回 1×1。不依赖 WebView 的 alpha/触摸/定时器，灭屏·后台·pauseTimers 下照样常驻可见。 */
     private var reminderView: FrameLayout? = null
     private var reminderParams: WindowManager.LayoutParams? = null
+    /**
+     * 说话气泡「戳破」专用触摸窗：与提醒气泡同一套思路（独立窗、1×1 待命、气泡可见时铺开），
+     * 避免被 dsh-pet.js 每帧心跳的 applyTouchLayersJson 收回。
+     */
+    private var whisperPopView: FrameLayout? = null
+    private var whisperPopParams: WindowManager.LayoutParams? = null
     /** 当前气泡卡内容（动态生成，整卡替换）；null = 无活跃气泡。 */
     private var reminderCard: View? = null
 
@@ -177,6 +183,7 @@ class PetService : Service() {
                     p.x = 0; p.y = 0; p.width = 1; p.height = 1
                     try { wm.updateViewLayout(touchViews[i], p) } catch (_: Exception) {}
                 }
+                collapseWhisperPopLayer()
                 Log.i("dsh-pet", "穿透模式已开启（触摸层收回，屏幕穿透）")
             } else {
                 Log.i("dsh-pet", "穿透模式已关闭（恢复正常触摸）")
@@ -429,6 +436,7 @@ class PetService : Service() {
         for (i in 0 until MAX_TOUCH_LAYERS) addTouchLayer()
         addCaptureLayer()
         addReminderLayer()
+        addWhisperPopLayer()
     }
 
     /** 提醒气泡专用触摸窗口：初始 1×1 @(0,0) 不挡任何东西，气泡可见时由 applyReminderBubbleRect 铺开。 */
@@ -459,6 +467,120 @@ class PetService : Service() {
             Log.w("dsh-pet", "添加提醒气泡窗口失败: ${e.message}")
             reminderView = null
             reminderParams = null
+        }
+    }
+
+    /**
+     * 说话气泡戳破用的触摸窗：结构同 addReminderLayer，初始 1×1 @(0,0) 不挡任何东西。
+     * 气泡出现时由 whisper-pop.js 上报包围盒，这里铺开并接住点击。
+     */
+    private fun addWhisperPopLayer() {
+        val v = FrameLayout(this)
+        v.setBackgroundColor(0x00000000)
+        v.setOnClickListener {
+            // 点到气泡 = 戳破：交给 JS 播动画并自行收起；同时立刻收回触摸窗
+            try {
+                webView?.evaluateJavascript(
+                    "(function(){try{if(window.__dshPopWhisper){window.__dshPopWhisper();return;}}catch(e){}})()",
+                    null,
+                )
+            } catch (e: Exception) {
+                Log.w("dsh-pet", "戳破气泡失败: " + e.message)
+            }
+            collapseWhisperPopLayer()
+        }
+        val p = WindowManager.LayoutParams(
+            1, 1,
+            overlayType(),
+            WindowManager.LayoutParams.FLAG_NOT_FOCUSABLE or
+                WindowManager.LayoutParams.FLAG_NOT_TOUCH_MODAL or
+                WindowManager.LayoutParams.FLAG_LAYOUT_IN_SCREEN or
+                WindowManager.LayoutParams.FLAG_LAYOUT_NO_LIMITS,
+            PixelFormat.TRANSLUCENT,
+        ).apply {
+            gravity = Gravity.TOP or Gravity.START
+            x = 0; y = 0
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.R) setFitInsetsTypes(0)
+            if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.P)
+                layoutInDisplayCutoutMode =
+                    WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_SHORT_EDGES
+        }
+        try {
+            wm.addView(v, p)
+            whisperPopView = v
+            whisperPopParams = p
+        } catch (e: Exception) {
+            Log.w("dsh-pet", "添加说话气泡触摸窗失败: " + e.message)
+            whisperPopView = null
+            whisperPopParams = null
+        }
+    }
+
+    /** 收回说话气泡触摸窗（1×1 @ 左上角）。 */
+    private fun collapseWhisperPopLayer() {
+        val v = whisperPopView ?: return
+        val p = whisperPopParams ?: return
+        try {
+            if (p.width == 1 && p.height == 1 && p.x == 0 && p.y == 0) return
+            p.x = 0; p.y = 0; p.width = 1; p.height = 1
+            wm.updateViewLayout(v, p)
+        } catch (e: Exception) {
+            Log.w("dsh-pet", "收回说话气泡触摸窗失败: " + e.message)
+        }
+    }
+
+    /**
+     * 说话气泡包围盒上报（JS 视口归一化比例）：换算成屏幕 px 铺开触摸窗。
+     * json = {x,y,w,h} 或 {active:false}（收回）。
+     *
+     * 与宠物命中区（applyTouchLayerRects）互不干扰：那是 8 个池化窗口，这里是 1 个专用窗口，
+     * 因此 dsh-pet.js 的心跳不会把它踩掉（提醒气泡当年踩过这个坑）。
+     */
+    fun applyWhisperBubbleRect(json: String) {
+        val v = whisperPopView ?: return
+        val p = whisperPopParams ?: return
+        main.post {
+            try {
+                val o = JSONObject(json)
+                if (!o.optBoolean("active", true)) {
+                    collapseWhisperPopLayer()
+                    return@post
+                }
+                val nx = o.optDouble("x", Double.NaN)
+                val ny = o.optDouble("y", Double.NaN)
+                val nw = o.optDouble("w", 0.0)
+                val nh = o.optDouble("h", 0.0)
+                if (!nx.isFinite() || !ny.isFinite() || nw <= 0.0 || nh <= 0.0) {
+                    collapseWhisperPopLayer()
+                    return@post
+                }
+                // 穿透模式 / 宠物隐藏时不铺（与命中区同一套语义）
+                if (clickThrough || petHidden) {
+                    collapseWhisperPopLayer()
+                    return@post
+                }
+                val (sw, sh) = screenSize()
+                val geo = renderGeometry()
+                val gx = geo[0]; val gy = geo[1]; val gw = geo[2]; val gh = geo[3]
+                if (gw <= 0 || gh <= 0) return@post
+                // JS 上报的是 WebView 视口比例，先还原到渲染窗内 px，再加窗口屏幕偏移
+                val x = (gx + Math.round(nx * gw).toInt()).coerceIn(0, (sw - 1).coerceAtLeast(0))
+                val y = (gy + Math.round(ny * gh).toInt()).coerceIn(0, (sh - 1).coerceAtLeast(0))
+                val w = Math.round(nw * gw).toInt().coerceIn(1, (sw - x).coerceAtLeast(1))
+                val h = Math.round(nh * gh).toInt().coerceIn(1, (sh - y).coerceAtLeast(1))
+                // 保险丝：气泡再大也不该吃掉半屏（异常量测时宁可不给点，也不能阻塞桌面）
+                val areaRatio = w.toLong() * h.toLong() * 1.0 / (sw.toLong() * sh.toLong() * 1.0)
+                if (areaRatio > 0.5) {
+                    Log.w("dsh-pet", "说话气泡命中块过大 " + w + "x" + h + "，丢弃")
+                    collapseWhisperPopLayer()
+                    return@post
+                }
+                if (p.x == x && p.y == y && p.width == w && p.height == h) return@post
+                p.x = x; p.y = y; p.width = w; p.height = h
+                wm.updateViewLayout(v, p)
+            } catch (e: Exception) {
+                Log.w("dsh-pet", "说话气泡命中区更新失败: " + e.message)
+            }
         }
     }
 
@@ -549,6 +671,7 @@ class PetService : Service() {
             v.addView(card, FrameLayout.LayoutParams(
                 FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
             activeReminderId = id
+            bubbleVisible = true
             try { wm.updateViewLayout(v, p) } catch (_: Exception) {}
             updateReminderBubblePosition()
             Log.i("dsh-pet", "原生常驻提醒气泡已显示(跟随宠物): $title")
@@ -561,7 +684,7 @@ class PetService : Service() {
     private fun updateReminderBubblePosition() {
         val v = reminderView ?: return
         val p = reminderParams ?: return
-        if (activeReminderId == null) return
+        if (!bubbleVisible) return
         try {
             val (sw, sh) = screenSize()
             val d = resources.displayMetrics.density
@@ -583,6 +706,75 @@ class PetService : Service() {
         } catch (_: Exception) {}
     }
 
+    /**
+     * 长按菜单「查询天气」入口（NativeBridge.weatherQuery 调用）：
+     * 异步取数，成功就在宠物旁弹天气气泡，失败 Toast 提示原因。
+     */
+    fun queryWeather() {
+        WeatherClient.query(this) { r ->
+            if (r.ok) {
+                showWeatherBubble(r.line(), r.icon)
+            } else {
+                android.widget.Toast.makeText(this, r.reason, android.widget.Toast.LENGTH_SHORT).show()
+            }
+        }
+    }
+
+    /**
+     * 天气气泡：复用提醒气泡窗口画一张天气小卡（图标 + 「城市 · 温度 描述」）。
+     * 由设置页「立即查询」调用；服务未运行则直接忽略（不自动拉起服务）。
+     */
+    fun showWeatherBubble(line: String, icon: String) {
+        val v = reminderView ?: return
+        val p = reminderParams ?: return
+        try {
+            val (sw, sh) = screenSize()
+            val d = resources.displayMetrics.density
+            val winW = (200 * d).toInt().coerceAtMost(sw)
+            p.width = winW
+            p.height = WindowManager.LayoutParams.WRAP_CONTENT
+            p.gravity = Gravity.TOP or Gravity.START
+            p.x = (sw - winW).coerceAtLeast(0)
+            p.y = 0
+            val card = LinearLayout(this).apply {
+                orientation = LinearLayout.HORIZONTAL
+                gravity = Gravity.CENTER_VERTICAL
+                background = GradientDrawable().apply {
+                    setColor(ContextCompat.getColor(this@PetService, R.color.dsh_bg_card))
+                    cornerRadius = 16f * d
+                    setStroke((1 * d).toInt(),
+                        ContextCompat.getColor(this@PetService, R.color.dsh_accent_stroke))
+                }
+                elevation = 10f * d
+                setPadding((14 * d).toInt(), (10 * d).toInt(), (14 * d).toInt(), (10 * d).toInt())
+            }
+            card.addView(TextView(this).apply {
+                text = icon
+                textSize = 15f
+                setPadding(0, 0, (8 * d).toInt(), 0)
+            })
+            card.addView(TextView(this).apply {
+                text = line
+                textSize = 13.5f
+                setTextColor(ContextCompat.getColor(this@PetService, R.color.dsh_text_primary))
+                maxLines = 2
+                ellipsize = android.text.TextUtils.TruncateAt.END
+            })
+            card.setOnClickListener { hideReminderBubble() }
+            reminderCard = card
+            activeReminderId = null   // 天气气泡不绑提醒 id
+            bubbleVisible = true
+            v.removeAllViews()
+            v.addView(card, FrameLayout.LayoutParams(
+                FrameLayout.LayoutParams.MATCH_PARENT, FrameLayout.LayoutParams.WRAP_CONTENT))
+            try { wm.updateViewLayout(v, p) } catch (_: Exception) { }
+            updateReminderBubblePosition()
+            Log.i("dsh-pet", "天气气泡已显示: " + line)
+        } catch (e: Exception) {
+            Log.w("dsh-pet", "天气气泡显示失败: " + e.message)
+        }
+    }
+
     /** 关闭原生气泡：收回 1×1、清卡。 */
     private fun hideReminderBubble() {
         val v = reminderView ?: return
@@ -592,6 +784,7 @@ class PetService : Service() {
             v.removeAllViews()
             reminderCard = null
             activeReminderId = null
+            bubbleVisible = false
             try { wm.updateViewLayout(v, p) } catch (_: Exception) {}
             Log.i("dsh-pet", "原生提醒气泡已关闭")
         } catch (e: Exception) {
@@ -856,10 +1049,19 @@ class PetService : Service() {
             // 菜单刚挂载，读取根元素矩形（归一化比例）供外部点击判定
             main.post {
                 webView?.evaluateJavascript(
-                    "(function(){var m=document.querySelector('.dsh-pet-menu');" +
-                        "if(!m)return 'null';var r=m.getBoundingClientRect();" +
-                        "return JSON.stringify({x:r.left/window.innerWidth,y:r.top/window.innerHeight," +
-                        "w:r.width/window.innerWidth,h:r.height/window.innerHeight});})()"
+                    // 注意：.dsh-pet-menu 根容器是 position:fixed;left:0;top:0 的 0×0 盒，
+                    // 直接量它得到的是 0×0，会让「菜单内点击」被误判成外点而收起菜单。
+                    // 必须量实际可见的菜单列（.dsh-pet-menu-column），取多列的并集。
+                    "(function(){var cols=document.querySelectorAll('.dsh-pet-menu-column');" +
+                        "if(!cols||cols.length===0)return 'null';var L=1e9,T=1e9,R=-1e9,B=-1e9;" +
+                        "for(var i=0;i<cols.length;i++){var c=cols[i];" +
+                        "if(!c.offsetParent&&c.getClientRects().length===0)continue;" +
+                        "var r=c.getBoundingClientRect();if(r.width<2||r.height<2)continue;" +
+                        "if(r.left<L)L=r.left;if(r.top<T)T=r.top;" +
+                        "if(r.right>R)R=r.right;if(r.bottom>B)B=r.bottom;}" +
+                        "if(R<L||B<T)return 'null';" +
+                        "return JSON.stringify({x:L/window.innerWidth,y:T/window.innerHeight," +
+                        "w:(R-L)/window.innerWidth,h:(B-T)/window.innerHeight});})()"
                 ) { json ->
                     if (json == "null" || json.isNullOrBlank()) return@evaluateJavascript
                     try {
@@ -921,6 +1123,8 @@ class PetService : Service() {
     /** 当前活跃提醒气泡的 id（点按跳提醒列表定位用）；null = 无活跃气泡。 */
     @Volatile
     private var activeReminderId: String? = null
+    /** 气泡窗当前是否有内容（提醒 / 天气共用同一窗口）：驱动 updateReminderBubblePosition 的跟随。 */
+    private var bubbleVisible = false
 
     /** 渲染页是否已加载完（reminder.js 已挂 window.__dshReminderBubble）。
      *  未到点前 WebView 可能尚未就绪：到点触发时若未就绪，气泡先暂存 [pendingReminderBubbles]，

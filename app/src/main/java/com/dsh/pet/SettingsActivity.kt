@@ -555,6 +555,54 @@ class SettingsActivity : AppCompatActivity() {
             }
         })
         root.addView(card {
+            addView(sectionTitle("天气与环境"))
+            addView(desc("开启后，宠物旁可显示当前城市与天气（数据来自公开免密钥接口，需联网）。"))
+            val weatherSw = Switch(this@SettingsActivity).apply {
+                text = "启用天气"
+                textSize = 14f
+                setTextColor(colorRes(R.color.dsh_text_primary))
+                isChecked = Store.prefBool(this@SettingsActivity, "weatherEnabled", false)
+            }
+            val cityEdit = input("城市", "留空按网络定位，如：杭州")
+            cityEdit.setText(Store.prefStr(this@SettingsActivity, "weatherCity", ""))
+            val weatherVal = TextView(this@SettingsActivity).apply {
+                text = ""
+                textSize = 13f
+                setLineSpacing(dp(2).toFloat(), 1f)
+                setTextColor(colorRes(R.color.dsh_text_hint))
+                setPadding(0, dp(6), 0, 0)
+            }
+            val queryRow = LinearLayout(this@SettingsActivity).apply {
+                orientation = LinearLayout.HORIZONTAL
+                setPadding(0, dp(10), 0, 0)
+            }
+            val queryBtn = pill("立即查询", false) {
+                weatherVal.text = "查询中…"
+                Store.prefSet(this@SettingsActivity, "weatherEnabled", weatherSw.isChecked)
+                Store.prefSetStr(this@SettingsActivity, "weatherCity", cityEdit.text.toString().trim())
+                WeatherClient.query(this@SettingsActivity) { r ->
+                    weatherVal.text = if (r.ok) "当前：" + r.line() else r.reason
+                    // 服务在跑就顺手在宠物旁弹一张天气小卡（没跑就只显示在设置页）
+                    if (r.ok && Store.prefBool(this@SettingsActivity, "weatherShowBubble", true)) {
+                        PetService.instance?.showWeatherBubble(r.line(), r.icon)
+                    }
+                }
+            }
+            queryRow.addView(queryBtn, LinearLayout.LayoutParams(0, ViewGroup.LayoutParams.WRAP_CONTENT, 1f))
+            addView(weatherSw)
+            addView(cityEdit)
+            addView(queryRow)
+            addView(weatherVal)
+            weatherSw.setOnCheckedChangeListener { _, checked ->
+                Store.prefSet(this@SettingsActivity, "weatherEnabled", checked)
+            }
+            cityEdit.setOnFocusChangeListener { _, hasFocus ->
+                if (!hasFocus) {
+                    Store.prefSetStr(this@SettingsActivity, "weatherCity", cityEdit.text.toString().trim())
+                }
+            }
+        })
+        root.addView(card {
             addView(sectionTitle("AI 对话"))
             aiEnabled = Switch(this@SettingsActivity).apply {
                 text = getString(R.string.settings_ai_enabled)
